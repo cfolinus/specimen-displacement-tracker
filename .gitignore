@@ -13,7 +13,6 @@ __pycache__/
 output_data/*.csv
 
 # Validation artifacts
-validation/*.xlsx
 validation/*.MOV
 validation/*.csv
 !validation/build_comparison.py
