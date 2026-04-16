@@ -56,13 +56,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Instron Dot Tracker")
-        self.geometry("1280x860")
-        self.minsize(1000, 700)
+        self.geometry("1280x900")
+        self.minsize(1000, 720)
 
         # State
         self.video_files = []           # list of Path
         self.trackers = {}              # {idx: finished VideoTracker}
-        self.cleaned_data = {}          # {idx: [(t, d), ...]} cleaned results
+        self.cleaned_data = {}          # {idx: {'results': [...], 'positions': [...]}}
         self.processing = False
         self.stop_requested = False
         self.msg_queue = queue.Queue()
@@ -78,6 +78,13 @@ class App(tk.Tk):
         self._play_after_id = None
         self._scrub_blocked = False
 
+        # Tracking option flags (set before running)
+        self.track_pixel_pos    = tk.BooleanVar(value=False)
+        self.track_mm_pos       = tk.BooleanVar(value=False)
+        self.track_dot_disp     = tk.BooleanVar(value=False)
+        self.track_interdot_disp = tk.BooleanVar(value=True)
+        self.track_interdot_dist = tk.BooleanVar(value=False)
+
         self._build_ui()
         self._poll_queue()
 
@@ -90,7 +97,8 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
-        toolbar = ttk.Frame(self, padding=6)
+        # ── Toolbar row 1: file controls + run ──────────────────────────
+        toolbar = ttk.Frame(self, padding=(6, 4))
         toolbar.pack(fill="x")
 
         ttk.Button(toolbar, text="Add Videos...", command=self._add_videos).pack(side="left", padx=3)
@@ -112,9 +120,27 @@ class App(tk.Tk):
         self.stop_btn = ttk.Button(toolbar, text="Stop", command=self._stop, state="disabled")
         self.stop_btn.pack(side="left", padx=3)
 
-        # Main paned layout
+        # ── Toolbar row 2: output variable selection ─────────────────────
+        options_bar = ttk.Frame(self, padding=(6, 2))
+        options_bar.pack(fill="x")
+
+        ttk.Label(options_bar, text="Output variables:", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(2, 6))
+
+        checks = [
+            ("Pixel position (x,y)",        self.track_pixel_pos),
+            ("Scaled position mm (x,y)",     self.track_mm_pos),
+            ("Per-dot displacement",         self.track_dot_disp),
+            ("Displacement between dots",    self.track_interdot_disp),
+            ("Distance between dots (mm)",   self.track_interdot_dist),
+        ]
+        for label, var in checks:
+            ttk.Checkbutton(options_bar, text=label, variable=var).pack(side="left", padx=6)
+
+        ttk.Separator(self, orient="horizontal").pack(fill="x", padx=6)
+
+        # ── Main paned layout ────────────────────────────────────────────
         pane = ttk.PanedWindow(self, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        pane.pack(fill="both", expand=True, padx=6, pady=(4, 6))
 
         # Left: video list
         left = ttk.Frame(pane, width=280)
@@ -178,17 +204,20 @@ class App(tk.Tk):
 
         tree_frame = ttk.Frame(self.data_tab)
         tree_frame.pack(fill="both", expand=True, padx=4, pady=4)
-        self.tree = ttk.Treeview(tree_frame, columns=("time", "distance", "displacement"), show="headings", height=25)
+
+        self.tree = ttk.Treeview(tree_frame, show="headings", height=25)
+        self.tree["columns"] = ("time", "displacement")
         self.tree.heading("time", text="Time (s)")
-        self.tree.heading("distance", text="Distance")
         self.tree.heading("displacement", text="Displacement")
-        self.tree.column("time", width=120, anchor="center")
-        self.tree.column("distance", width=140, anchor="center")
+        self.tree.column("time", width=100, anchor="center")
         self.tree.column("displacement", width=140, anchor="center")
-        tree_sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_sb.set)
+
+        tree_sb_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        tree_sb_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=tree_sb_y.set, xscrollcommand=tree_sb_x.set)
+        tree_sb_y.pack(side="right", fill="y")
+        tree_sb_x.pack(side="bottom", fill="x")
         self.tree.pack(side="left", fill="both", expand=True)
-        tree_sb.pack(side="right", fill="y")
 
         export_frame = ttk.Frame(self.data_tab)
         export_frame.pack(fill="x", padx=4, pady=4)
@@ -238,6 +267,16 @@ class App(tk.Tk):
         self.trackers.clear()
         self.cleaned_data.clear()
         self._close_review()
+
+    # --------------------------------------------------------- Tracking options
+    def _get_track_opts(self):
+        return dict(
+            track_pixel_pos     = self.track_pixel_pos.get(),
+            track_mm_pos        = self.track_mm_pos.get(),
+            track_dot_disp      = self.track_dot_disp.get(),
+            track_interdot_disp = self.track_interdot_disp.get(),
+            track_interdot_dist = self.track_interdot_dist.get(),
+        )
 
     # --------------------------------------------------------- List selection / review
     def _on_list_select(self, _event=None):
@@ -333,7 +372,6 @@ class App(tk.Tk):
 
     def _toggle_play(self):
         if self._review_cap is None:
-            # If no review is open but a completed video is selected, open it
             sel = self.listbox.curselection()
             if sel and sel[0] in self.trackers:
                 self._open_review(sel[0])
@@ -353,7 +391,6 @@ class App(tk.Tk):
             self._playing = False
             self.play_btn.configure(text="Play")
             return
-        # Update scrub position without triggering _on_scrub redundantly
         self._scrub_blocked = True
         self.scrub_var.set(cur)
         self._scrub_blocked = False
@@ -367,8 +404,10 @@ class App(tk.Tk):
         self._show_plot(idx, cleaned=has_cleaned)
         if has_cleaned:
             raw_n = len(self.trackers[idx].results)
-            clean_n = len(self.cleaned_data[idx])
-            self.clean_label.configure(text=f"Removed {raw_n - clean_n} outliers ({(raw_n - clean_n)/raw_n*100:.1f}%)")
+            clean_n = len(self.cleaned_data[idx]['results'])
+            removed = raw_n - clean_n
+            self.clean_label.configure(
+                text=f"Removed {removed} outliers ({removed/raw_n*100:.1f}%)")
         else:
             self.clean_label.configure(text="")
 
@@ -377,6 +416,12 @@ class App(tk.Tk):
         if not self.video_files:
             messagebox.showinfo("Info", "Add some videos first.")
             return
+        if not any([self.track_pixel_pos.get(), self.track_mm_pos.get(),
+                    self.track_dot_disp.get(), self.track_interdot_disp.get(),
+                    self.track_interdot_dist.get()]):
+            messagebox.showinfo("Info", "Select at least one output variable.")
+            return
+
         self.processing = True
         self.stop_requested = False
         self.run_btn.configure(state="disabled")
@@ -384,17 +429,18 @@ class App(tk.Tk):
         self._close_review()
 
         skip = FRAME_SKIP_OPTIONS[self.skip_var.get()]
+        opts = self._get_track_opts()
         indices = list(range(len(self.video_files)))
 
         self.worker_thread = threading.Thread(
-            target=self._worker, args=(indices, skip), daemon=True)
+            target=self._worker, args=(indices, skip, opts), daemon=True)
         self.worker_thread.start()
 
     def _stop(self):
         self.stop_requested = True
         self.stop_btn.configure(state="disabled")
 
-    def _worker(self, indices, skip):
+    def _worker(self, indices, skip, opts):
         """Runs in background thread — processes videos as fast as possible."""
         for vid_idx in indices:
             if self.stop_requested:
@@ -409,14 +455,12 @@ class App(tk.Tk):
                 self.msg_queue.put(MsgError(vid_idx, tracker.error or "Unknown error"))
                 continue
 
-            # Send first frame
             self.msg_queue.put(MsgProgress(vid_idx, 0, tracker.total_frames, first))
 
             frame_count = 0
             while not tracker.finished and not self.stop_requested:
                 frame = tracker.step()
                 frame_count += 1
-                # Send frame to UI periodically (every ~20 processed frames)
                 send_frame = frame if (frame_count % 20 == 0) else None
                 self.msg_queue.put(MsgProgress(
                     vid_idx, tracker.current_frame_idx, tracker.total_frames, send_frame))
@@ -427,9 +471,9 @@ class App(tk.Tk):
 
             tracker.release()
 
-            # Save CSV
+            # Auto-save CSV with selected output variables
             csv_path = OUTPUT_DIR / (path.stem + ".csv")
-            tracker.save_csv(csv_path)
+            tracker.save_csv(csv_path, **opts)
 
             self.msg_queue.put(MsgDone(vid_idx, tracker))
 
@@ -464,7 +508,6 @@ class App(tk.Tk):
 
         if msg.frame_bgr is not None:
             self._current_processing_frame = msg.frame_bgr
-            # Show live preview only if user is watching this video (or no review open)
             sel = self.listbox.curselection()
             viewing_current = (not sel) or (sel and sel[0] == msg.vid_idx)
             if viewing_current and self._review_idx is None:
@@ -526,72 +569,185 @@ class App(tk.Tk):
         dists = np.array([r[1] for r in tracker.results])
         n_orig = len(dists)
 
-        cleaned_t, cleaned_d = clean_data(times, dists)
-        n_removed = n_orig - len(cleaned_d)
+        clean_t, clean_d, kept_indices = clean_data(times, dists)
+        n_removed = n_orig - len(clean_d)
 
-        self.cleaned_data[idx] = list(zip(cleaned_t.tolist(), cleaned_d.tolist()))
-        self.clean_label.configure(text=f"Removed {n_removed} outliers ({n_removed/n_orig*100:.1f}%)")
+        self.cleaned_data[idx] = {
+            'results':   list(zip(clean_t.tolist(), clean_d.tolist())),
+            'positions': [tracker.positions[i] for i in kept_indices],
+        }
 
-        # Update table to show cleaned data
+        removed_pct = n_removed / n_orig * 100
+        self.clean_label.configure(
+            text=f"Removed {n_removed} outliers ({removed_pct:.1f}%)")
+
         self._show_data_table(idx, cleaned=True)
-        # Update plot with both raw and cleaned
         self._show_plot(idx, cleaned=True)
 
+    # --------------------------------------------------------- Data table
     def _show_data_table(self, idx, cleaned=False):
         tracker = self.trackers.get(idx)
         if tracker is None:
             return
-        self.tree.delete(*self.tree.get_children())
-        self.tree.heading("distance", text=f"Distance ({tracker.unit})")
-        self.tree.heading("displacement", text=f"Displacement ({tracker.unit})")
 
+        opts = self._get_track_opts()
+        h    = tracker.height
+        ppm  = tracker.px_per_mm
+        unit = tracker.unit
+
+        # ── Build dynamic column list ────────────────────────────────────
+        col_ids  = ['time']
+        col_hdrs = ['Time (s)']
+        col_wids = [90]
+
+        # dot1 = bottom, dot2 = top
+        if opts['track_pixel_pos']:
+            for lbl in ['Dot1 X (px)', 'Dot1 Y (px)', 'Dot2 X (px)', 'Dot2 Y (px)']:
+                col_ids.append(lbl)
+                col_hdrs.append(lbl)
+                col_wids.append(100)
+
+        if opts['track_mm_pos']:
+            for lbl in ['Dot1 X (mm)', 'Dot1 Y (mm)', 'Dot2 X (mm)', 'Dot2 Y (mm)']:
+                col_ids.append(lbl)
+                col_hdrs.append(lbl)
+                col_wids.append(110)
+
+        if opts['track_dot_disp']:
+            for lbl in [f'Dot1 dX ({unit})', f'Dot1 dY ({unit})',
+                        f'Dot2 dX ({unit})', f'Dot2 dY ({unit})']:
+                col_ids.append(lbl)
+                col_hdrs.append(lbl)
+                col_wids.append(110)
+
+        if opts['track_interdot_disp']:
+            lbl = f'Displacement ({unit})'
+            col_ids.append(lbl)
+            col_hdrs.append(lbl)
+            col_wids.append(130)
+
+        if opts['track_interdot_dist']:
+            lbl = f'Distance ({unit})'
+            col_ids.append(lbl)
+            col_hdrs.append(lbl)
+            col_wids.append(120)
+
+        self.tree['columns'] = col_ids
+        self.tree['show'] = 'headings'
+        for cid, hdr, wid in zip(col_ids, col_hdrs, col_wids):
+            self.tree.heading(cid, text=hdr)
+            self.tree.column(cid, width=wid, anchor='center', minwidth=70)
+
+        # ── Choose data source ───────────────────────────────────────────
         if cleaned and idx in self.cleaned_data:
-            data = self.cleaned_data[idx]
+            cd = self.cleaned_data[idx]
+            data      = cd['results']
+            positions = cd['positions']
         else:
-            data = tracker.results
+            data      = tracker.results
+            positions = tracker.positions
 
-        d0 = data[0][1] if data else 0
-        for t, d in data:
-            disp = d - d0
-            self.tree.insert("", "end", values=(f"{t:.4f}", f"{d:.4f}", f"{disp:.4f}"))
+        d0   = data[0][1]       if data      else 0
+        top0 = positions[0][0]  if positions else None
+        bot0 = positions[0][1]  if positions else None
 
+        # ── Fill rows ────────────────────────────────────────────────────
+        self.tree.delete(*self.tree.get_children())
+        for i, (t, d) in enumerate(data):
+            pt = positions[i][0] if i < len(positions) else None
+            pb = positions[i][1] if i < len(positions) else None
+            row = [f'{t:.4f}']
+
+            # dot1 = bottom (pb), dot2 = top (pt)
+            if opts['track_pixel_pos']:
+                if pt and pb:
+                    row += [f'{pb[0]:.1f}', f'{h - pb[1]:.1f}',
+                            f'{pt[0]:.1f}', f'{h - pt[1]:.1f}']
+                else:
+                    row += ['', '', '', '']
+
+            if opts['track_mm_pos']:
+                if pt and pb and ppm:
+                    row += [f'{pb[0]/ppm:.3f}', f'{(h - pb[1])/ppm:.3f}',
+                            f'{pt[0]/ppm:.3f}', f'{(h - pt[1])/ppm:.3f}']
+                else:
+                    row += ['', '', '', '']
+
+            if opts['track_dot_disp']:
+                if pt and pb and top0 and bot0:
+                    if ppm:
+                        row += [f'{(pb[0] - bot0[0])/ppm:.4f}',
+                                f'{((h - pb[1]) - (h - bot0[1]))/ppm:.4f}',
+                                f'{(pt[0] - top0[0])/ppm:.4f}',
+                                f'{((h - pt[1]) - (h - top0[1]))/ppm:.4f}']
+                    else:
+                        row += [f'{pb[0] - bot0[0]:.2f}',
+                                f'{(h - pb[1]) - (h - bot0[1]):.2f}',
+                                f'{pt[0] - top0[0]:.2f}',
+                                f'{(h - pt[1]) - (h - top0[1]):.2f}']
+                else:
+                    row += ['', '', '', '']
+
+            if opts['track_interdot_disp']:
+                row.append(f'{d - d0:.4f}')
+
+            if opts['track_interdot_dist']:
+                row.append(f'{d:.4f}')
+
+            self.tree.insert('', 'end', values=row)
+
+    # --------------------------------------------------------- Plot
     def _show_plot(self, idx, cleaned=False):
         tracker = self.trackers.get(idx)
         if tracker is None:
             return
         self.ax.clear()
+        opts = self._get_track_opts()
+
+        # Choose what to plot: prefer interdot displacement, then distance
+        if opts['track_interdot_disp']:
+            y_label = f'Displacement ({tracker.unit})'
+            def get_y(data):
+                d0 = data[0][1] if data else 0
+                return [r[1] - d0 for r in data]
+        elif opts['track_interdot_dist']:
+            y_label = f'Distance ({tracker.unit})'
+            def get_y(data):
+                return [r[1] for r in data]
+        else:
+            # Nothing inter-dot to plot — skip
+            self.ax.set_title(self.video_files[idx].name)
+            self.ax.text(0.5, 0.5, 'Enable displacement or distance\nto see a plot',
+                         ha='center', va='center', transform=self.ax.transAxes,
+                         color='gray', fontsize=11)
+            self.fig.tight_layout()
+            self.plot_canvas.draw()
+            return
 
         raw_t = [r[0] for r in tracker.results]
-        raw_d0 = tracker.results[0][1] if tracker.results else 0
-        raw_disp = [r[1] - raw_d0 for r in tracker.results]
+        raw_y = get_y(tracker.results)
 
         if cleaned and idx in self.cleaned_data:
-            clean = self.cleaned_data[idx]
-            clean_d0 = clean[0][1] if clean else 0
+            clean = self.cleaned_data[idx]['results']
             clean_t = [r[0] for r in clean]
-            clean_disp = [r[1] - clean_d0 for r in clean]
-            self.ax.plot(raw_t, raw_disp, linewidth=0.8, color="#cccccc", label="Raw", zorder=1)
-            self.ax.plot(clean_t, clean_disp, linewidth=1.2, color="#2563eb", label="Cleaned", zorder=2)
+            clean_y = get_y(clean)
+            self.ax.plot(raw_t, raw_y, linewidth=0.8, color="#cccccc", label="Raw", zorder=1)
+            self.ax.plot(clean_t, clean_y, linewidth=1.2, color="#2563eb", label="Cleaned", zorder=2)
             self.ax.legend(loc="upper left", fontsize=9)
         else:
-            self.ax.plot(raw_t, raw_disp, linewidth=1.2, color="#2563eb")
+            self.ax.plot(raw_t, raw_y, linewidth=1.2, color="#2563eb")
 
         self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel(f"Displacement ({tracker.unit})")
+        self.ax.set_ylabel(y_label)
         self.ax.set_title(self.video_files[idx].name)
         self.ax.grid(True, alpha=0.3)
         self.fig.tight_layout()
         self.plot_canvas.draw()
 
     # --------------------------------------------------------- Export
-    def _write_displacement_csv(self, path, data, unit):
-        """Write time and displacement (distance - initial distance) to CSV."""
-        d0 = data[0][1] if data else 0
-        with open(path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["time_s", f"displacement_{unit}"])
-            for t, d in data:
-                writer.writerow([f"{t:.4f}", f"{d - d0:.4f}"])
+    def _write_csv(self, path, results, positions, tracker, opts):
+        """Write selected tracking variables to a CSV file."""
+        tracker.save_csv(path, results=results, positions=positions, **opts)
 
     def _export_csv(self):
         idx, tracker = self._get_selected_tracker()
@@ -604,7 +760,7 @@ class App(tk.Tk):
             initialfile=f"{stem}.csv", filetypes=[("CSV", "*.csv")])
         if not path:
             return
-        self._write_displacement_csv(path, tracker.results, tracker.unit)
+        self._write_csv(path, tracker.results, tracker.positions, tracker, self._get_track_opts())
         messagebox.showinfo("Saved", f"CSV saved to:\n{path}")
 
     def _export_cleaned_csv(self):
@@ -621,23 +777,23 @@ class App(tk.Tk):
             initialfile=f"{stem}_cleaned.csv", filetypes=[("CSV", "*.csv")])
         if not path:
             return
-        self._write_displacement_csv(path, self.cleaned_data[idx], tracker.unit)
+        cd = self.cleaned_data[idx]
+        self._write_csv(path, cd['results'], cd['positions'], tracker, self._get_track_opts())
         messagebox.showinfo("Saved", f"Cleaned CSV saved to:\n{path}")
 
 
+# ── Outlier cleaning ──────────────────────────────────────────────────────────
 def clean_data(times, dists):
     """
     Remove outlier points from tensile test distance data.
 
-    Strategy: tensile tests produce smoothly varying distance curves.
-    Outliers are points where the frame-to-frame change (velocity) is
-    far outside the local norm, indicating a tracking glitch.
-
-    Uses a rolling median of the velocity to detect jumps, then removes
-    points that deviate too far from the local trend.
+    Returns (clean_times, clean_dists, kept_indices) where kept_indices
+    are the original integer indices of the rows that were retained.
     """
     if len(dists) < 10:
-        return times, dists
+        return times, dists, np.arange(len(dists))
+
+    all_idx = np.arange(len(dists))
 
     # Pass 1: Remove velocity outliers (sudden jumps)
     dt = np.diff(times)
@@ -645,7 +801,6 @@ def clean_data(times, dists):
     dt[dt == 0] = 1e-6
     velocity = dd / dt
 
-    # Rolling median velocity over a window
     window = min(51, len(velocity) // 4 * 2 + 1)
     if window < 3:
         window = 3
@@ -659,18 +814,17 @@ def clean_data(times, dists):
         med = np.median(local_v)
         mad = np.median(np.abs(local_v - med))
         mad = max(mad, 1e-6)
-        # Flag if this velocity is > 5 MADs from median
         if abs(velocity[i] - med) > 5 * mad:
-            # Remove the endpoint of this jump (i+1)
             keep[i + 1] = False
 
-    times_1 = times[keep]
-    dists_1 = dists[keep]
+    times_1  = times[keep]
+    dists_1  = dists[keep]
+    idx_1    = all_idx[keep]
 
     if len(dists_1) < 10:
-        return times_1, dists_1
+        return times_1, dists_1, idx_1
 
-    # Pass 2: Remove points that deviate from a local moving average
+    # Pass 2: Remove position outliers from moving median
     window2 = min(31, len(dists_1) // 4 * 2 + 1)
     if window2 < 3:
         window2 = 3
@@ -687,10 +841,9 @@ def clean_data(times, dists):
         if abs(dists_1[i] - med) > 5 * mad:
             keep2[i] = False
 
-    return times_1[keep2], dists_1[keep2]
+    return times_1[keep2], dists_1[keep2], idx_1[keep2]
 
 
 if __name__ == "__main__":
     app = App()
     app.mainloop()
-

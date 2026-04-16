@@ -480,13 +480,96 @@ class VideoTracker:
             parts.append(f"cal: {self.initial_distance_mm} mm")
         return "  |  ".join(parts)
 
-    def save_csv(self, path):
-        d0 = self.results[0][1] if self.results else 0
+    def save_csv(self, path, results=None, positions=None,
+                 track_pixel_pos=False, track_mm_pos=False,
+                 track_dot_disp=False, track_interdot_disp=True,
+                 track_interdot_dist=False):
+        """
+        Write selected tracking variables to CSV.
+
+        Coordinate system: origin at bottom-left of frame (y is flipped).
+
+        Columns (depending on options selected):
+          time_s
+          top_x_px, top_y_px, bot_x_px, bot_y_px       [pixel_pos]
+          top_x_mm, top_y_mm, bot_x_mm, bot_y_mm        [mm_pos]
+          top_dx_<unit>, top_dy_<unit>,
+          bot_dx_<unit>, bot_dy_<unit>                   [dot_disp]
+          displacement_<unit>                            [interdot_disp]
+          distance_<unit>                                [interdot_dist]
+        """
+        if results is None:
+            results = self.results
+        if positions is None:
+            positions = self.positions
+
+        h = self.height
+        ppm = self.px_per_mm
+        unit = self.unit
+
+        d0 = results[0][1] if results else 0
+        top0 = positions[0][0] if positions else None
+        bot0 = positions[0][1] if positions else None
+
+        # Build header
+        header = ['time_s']
+        if track_pixel_pos:
+            header += ['dot1_x_px', 'dot1_y_px', 'dot2_x_px', 'dot2_y_px']
+        if track_mm_pos:
+            header += ['dot1_x_mm', 'dot1_y_mm', 'dot2_x_mm', 'dot2_y_mm']
+        if track_dot_disp:
+            header += [f'dot1_dx_{unit}', f'dot1_dy_{unit}',
+                       f'dot2_dx_{unit}', f'dot2_dy_{unit}']
+        if track_interdot_disp:
+            header.append(f'displacement_{unit}')
+        if track_interdot_dist:
+            header.append(f'distance_{unit}')
+
         with open(path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["time_s", f"displacement_{self.unit}"])
-            for t, d in self.results:
-                writer.writerow([f"{t:.4f}", f"{d - d0:.4f}"])
+            writer.writerow(header)
+            for i, (t, d) in enumerate(results):
+                pt = positions[i][0] if i < len(positions) else None
+                pb = positions[i][1] if i < len(positions) else None
+                row = [f'{t:.4f}']
+
+                # dot1 = bottom (pb), dot2 = top (pt)
+                if track_pixel_pos:
+                    if pt is not None and pb is not None:
+                        row += [f'{pb[0]:.2f}', f'{h - pb[1]:.2f}',
+                                f'{pt[0]:.2f}', f'{h - pt[1]:.2f}']
+                    else:
+                        row += ['', '', '', '']
+
+                if track_mm_pos:
+                    if pt is not None and pb is not None and ppm:
+                        row += [f'{pb[0]/ppm:.4f}', f'{(h - pb[1])/ppm:.4f}',
+                                f'{pt[0]/ppm:.4f}', f'{(h - pt[1])/ppm:.4f}']
+                    else:
+                        row += ['', '', '', '']
+
+                if track_dot_disp:
+                    if pt is not None and pb is not None and top0 is not None and bot0 is not None:
+                        if ppm:
+                            row += [f'{(pb[0] - bot0[0])/ppm:.4f}',
+                                    f'{((h - pb[1]) - (h - bot0[1]))/ppm:.4f}',
+                                    f'{(pt[0] - top0[0])/ppm:.4f}',
+                                    f'{((h - pt[1]) - (h - top0[1]))/ppm:.4f}']
+                        else:
+                            row += [f'{pb[0] - bot0[0]:.2f}',
+                                    f'{(h - pb[1]) - (h - bot0[1]):.2f}',
+                                    f'{pt[0] - top0[0]:.2f}',
+                                    f'{(h - pt[1]) - (h - top0[1]):.2f}']
+                    else:
+                        row += ['', '', '', '']
+
+                if track_interdot_disp:
+                    row.append(f'{d - d0:.4f}')
+
+                if track_interdot_dist:
+                    row.append(f'{d:.4f}')
+
+                writer.writerow(row)
 
     # ---- internal ----
 
