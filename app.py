@@ -345,15 +345,15 @@ class App(tk.Tk):
             return
 
         # Find the closest tracked position for this frame
-        pos_top, pos_bot, dist_val = None, None, None
+        dots, dist_val = [], None
         if tracker.frame_indices:
             fi = np.array(tracker.frame_indices)
             closest = np.searchsorted(fi, frame_idx, side='right') - 1
             closest = max(0, min(closest, len(tracker.positions) - 1))
-            pos_top, pos_bot = tracker.positions[closest]
+            dots = tracker.positions[closest]
             dist_val = tracker.results[closest][1]
 
-        annotated = annotate_frame(frame, pos_top, pos_bot, dist_val, tracker.unit)
+        annotated = annotate_frame(frame, dots, dist_val, tracker.unit)
         self._show_frame(annotated)
 
         fps = self._review_cap.get(cv2.CAP_PROP_FPS) or 30
@@ -566,14 +566,25 @@ class App(tk.Tk):
             return
 
         times = np.array([r[0] for r in tracker.results])
-        dists = np.array([r[1] for r in tracker.results])
-        n_orig = len(dists)
+        n_orig = len(times)
 
-        clean_t, clean_d, kept_indices = clean_data(times, dists)
-        n_removed = n_orig - len(clean_d)
+        # Decide what signal to clean on: inter-dot distance for 2+ dots,
+        # else dot1's y-coordinate (the primary motion axis).
+        if tracker.n_dots >= 2 and all(r[1] is not None for r in tracker.results):
+            signal = np.array([r[1] for r in tracker.results])
+        else:
+            signal = np.array([
+                tracker.positions[i][0][1] if i < len(tracker.positions)
+                                              and tracker.positions[i][0] is not None
+                else np.nan
+                for i in range(n_orig)
+            ])
+
+        _, _, kept_indices = clean_data(times, signal)
+        n_removed = n_orig - len(kept_indices)
 
         self.cleaned_data[idx] = {
-            'results':   list(zip(clean_t.tolist(), clean_d.tolist())),
+            'results':   [tracker.results[i] for i in kept_indices],
             'positions': [tracker.positions[i] for i in kept_indices],
         }
 
@@ -594,43 +605,34 @@ class App(tk.Tk):
         h    = tracker.height
         ppm  = tracker.px_per_mm
         unit = tracker.unit
+        n    = tracker.n_dots
 
-        # ── Build dynamic column list ────────────────────────────────────
+        # ── Build dynamic column list per dot ────────────────────────────
         col_ids  = ['time']
         col_hdrs = ['Time (s)']
         col_wids = [90]
 
-        # dot1 = bottom, dot2 = top
+        def add_col(label, w=110):
+            col_ids.append(label)
+            col_hdrs.append(label)
+            col_wids.append(w)
+
         if opts['track_pixel_pos']:
-            for lbl in ['Dot1 X (px)', 'Dot1 Y (px)', 'Dot2 X (px)', 'Dot2 Y (px)']:
-                col_ids.append(lbl)
-                col_hdrs.append(lbl)
-                col_wids.append(100)
-
+            for i in range(n):
+                add_col(f'Dot{i+1} X (px)', 100)
+                add_col(f'Dot{i+1} Y (px)', 100)
         if opts['track_mm_pos']:
-            for lbl in ['Dot1 X (mm)', 'Dot1 Y (mm)', 'Dot2 X (mm)', 'Dot2 Y (mm)']:
-                col_ids.append(lbl)
-                col_hdrs.append(lbl)
-                col_wids.append(110)
-
+            for i in range(n):
+                add_col(f'Dot{i+1} X (mm)')
+                add_col(f'Dot{i+1} Y (mm)')
         if opts['track_dot_disp']:
-            for lbl in [f'Dot1 dX ({unit})', f'Dot1 dY ({unit})',
-                        f'Dot2 dX ({unit})', f'Dot2 dY ({unit})']:
-                col_ids.append(lbl)
-                col_hdrs.append(lbl)
-                col_wids.append(110)
-
-        if opts['track_interdot_disp']:
-            lbl = f'Displacement ({unit})'
-            col_ids.append(lbl)
-            col_hdrs.append(lbl)
-            col_wids.append(130)
-
-        if opts['track_interdot_dist']:
-            lbl = f'Distance ({unit})'
-            col_ids.append(lbl)
-            col_hdrs.append(lbl)
-            col_wids.append(120)
+            for i in range(n):
+                add_col(f'Dot{i+1} dX ({unit})')
+                add_col(f'Dot{i+1} dY ({unit})')
+        if opts['track_interdot_disp'] and n >= 2:
+            add_col(f'Displacement ({unit})', 130)
+        if opts['track_interdot_dist'] and n >= 2:
+            add_col(f'Distance ({unit})', 120)
 
         self.tree['columns'] = col_ids
         self.tree['show'] = 'headings'
@@ -647,52 +649,62 @@ class App(tk.Tk):
             data      = tracker.results
             positions = tracker.positions
 
-        d0   = data[0][1]       if data      else 0
-        top0 = positions[0][0]  if positions else None
-        bot0 = positions[0][1]  if positions else None
+        if not data:
+            self.tree.delete(*self.tree.get_children())
+            return
+
+        d0 = data[0][1] if data[0][1] is not None else None
+        ref_positions = positions[0] if positions else [None] * n
 
         # ── Fill rows ────────────────────────────────────────────────────
         self.tree.delete(*self.tree.get_children())
         for i, (t, d) in enumerate(data):
-            pt = positions[i][0] if i < len(positions) else None
-            pb = positions[i][1] if i < len(positions) else None
+            pts = positions[i] if i < len(positions) else [None] * n
+            if len(pts) < n:
+                pts = list(pts) + [None] * (n - len(pts))
             row = [f'{t:.4f}']
 
-            # dot1 = bottom (pb), dot2 = top (pt)
+            # Pixel position
             if opts['track_pixel_pos']:
-                if pt and pb:
-                    row += [f'{pb[0]:.1f}', f'{h - pb[1]:.1f}',
-                            f'{pt[0]:.1f}', f'{h - pt[1]:.1f}']
-                else:
-                    row += ['', '', '', '']
-
-            if opts['track_mm_pos']:
-                if pt and pb and ppm:
-                    row += [f'{pb[0]/ppm:.3f}', f'{(h - pb[1])/ppm:.3f}',
-                            f'{pt[0]/ppm:.3f}', f'{(h - pt[1])/ppm:.3f}']
-                else:
-                    row += ['', '', '', '']
-
-            if opts['track_dot_disp']:
-                if pt and pb and top0 and bot0:
-                    if ppm:
-                        row += [f'{(pb[0] - bot0[0])/ppm:.4f}',
-                                f'{((h - pb[1]) - (h - bot0[1]))/ppm:.4f}',
-                                f'{(pt[0] - top0[0])/ppm:.4f}',
-                                f'{((h - pt[1]) - (h - top0[1]))/ppm:.4f}']
+                for j in range(n):
+                    p = pts[j]
+                    if p is not None:
+                        row += [f'{p[0]:.1f}', f'{h - p[1]:.1f}']
                     else:
-                        row += [f'{pb[0] - bot0[0]:.2f}',
-                                f'{(h - pb[1]) - (h - bot0[1]):.2f}',
-                                f'{pt[0] - top0[0]:.2f}',
-                                f'{(h - pt[1]) - (h - top0[1]):.2f}']
+                        row += ['', '']
+
+            # mm position
+            if opts['track_mm_pos']:
+                for j in range(n):
+                    p = pts[j]
+                    if p is not None and ppm:
+                        row += [f'{p[0]/ppm:.3f}', f'{(h - p[1])/ppm:.3f}']
+                    else:
+                        row += ['', '']
+
+            # Per-dot displacement
+            if opts['track_dot_disp']:
+                for j in range(n):
+                    p = pts[j]
+                    p0 = ref_positions[j] if j < len(ref_positions) else None
+                    if p is not None and p0 is not None:
+                        dx = p[0] - p0[0]
+                        dy = (h - p[1]) - (h - p0[1])
+                        if ppm:
+                            row += [f'{dx/ppm:.4f}', f'{dy/ppm:.4f}']
+                        else:
+                            row += [f'{dx:.2f}', f'{dy:.2f}']
+                    else:
+                        row += ['', '']
+
+            # Inter-dot displacement / distance
+            if opts['track_interdot_disp'] and n >= 2:
+                if d is not None and d0 is not None:
+                    row.append(f'{d - d0:.4f}')
                 else:
-                    row += ['', '', '', '']
-
-            if opts['track_interdot_disp']:
-                row.append(f'{d - d0:.4f}')
-
-            if opts['track_interdot_dist']:
-                row.append(f'{d:.4f}')
+                    row.append('')
+            if opts['track_interdot_dist'] and n >= 2:
+                row.append(f'{d:.4f}' if d is not None else '')
 
             self.tree.insert('', 'end', values=row)
 
@@ -703,34 +715,56 @@ class App(tk.Tk):
             return
         self.ax.clear()
         opts = self._get_track_opts()
+        n = tracker.n_dots
+        h = tracker.height
+        ppm = tracker.px_per_mm
 
-        # Choose what to plot: prefer interdot displacement, then distance
-        if opts['track_interdot_disp']:
+        get_y_raw = None   # function: data (list of (t, d)) -> y values
+        get_y_pos = None   # function: positions (list of lists) -> y values
+
+        # Prefer inter-dot metrics when we actually have 2+ dots
+        if n >= 2 and opts['track_interdot_disp']:
             y_label = f'Displacement ({tracker.unit})'
-            def get_y(data):
+            def get_y_raw(data):
                 d0 = data[0][1] if data else 0
                 return [r[1] - d0 for r in data]
-        elif opts['track_interdot_dist']:
+        elif n >= 2 and opts['track_interdot_dist']:
             y_label = f'Distance ({tracker.unit})'
-            def get_y(data):
+            def get_y_raw(data):
                 return [r[1] for r in data]
         else:
-            # Nothing inter-dot to plot — skip
-            self.ax.set_title(self.video_files[idx].name)
-            self.ax.text(0.5, 0.5, 'Enable displacement or distance\nto see a plot',
-                         ha='center', va='center', transform=self.ax.transAxes,
-                         color='gray', fontsize=11)
-            self.fig.tight_layout()
-            self.plot_canvas.draw()
-            return
+            # 1-dot case (or no inter-dot option enabled):
+            # plot dot1 y-displacement (bottom-left origin)
+            def _pos_y_disp(positions):
+                if not positions:
+                    return []
+                ref = positions[0][0] if positions[0] else None
+                y0 = (h - ref[1]) if ref is not None else 0.0
+                out = []
+                for pts in positions:
+                    p = pts[0] if pts else None
+                    if p is None:
+                        out.append(np.nan)
+                    else:
+                        yv = (h - p[1]) - y0
+                        out.append(yv / ppm if ppm else yv)
+                return out
+            get_y_pos = _pos_y_disp
+            y_label = f'Dot1 Y displacement ({tracker.unit})'
 
         raw_t = [r[0] for r in tracker.results]
-        raw_y = get_y(tracker.results)
+        if get_y_raw is not None:
+            raw_y = get_y_raw(tracker.results)
+        else:
+            raw_y = get_y_pos(tracker.positions)
 
         if cleaned and idx in self.cleaned_data:
-            clean = self.cleaned_data[idx]['results']
-            clean_t = [r[0] for r in clean]
-            clean_y = get_y(clean)
+            cd = self.cleaned_data[idx]
+            clean_t = [r[0] for r in cd['results']]
+            if get_y_raw is not None:
+                clean_y = get_y_raw(cd['results'])
+            else:
+                clean_y = get_y_pos(cd['positions'])
             self.ax.plot(raw_t, raw_y, linewidth=0.8, color="#cccccc", label="Raw", zorder=1)
             self.ax.plot(clean_t, clean_y, linewidth=1.2, color="#2563eb", label="Cleaned", zorder=2)
             self.ax.legend(loc="upper left", fontsize=9)
