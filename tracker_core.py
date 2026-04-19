@@ -429,6 +429,7 @@ class VideoTracker:
         self.frame_indices = []
         self.current_frame_idx = 0
         self.consecutive_failures = 0
+        self.redetections = 0        # number of successful re-locks via full detector
         self.finished = False
         self.error = None
         self._template_update_counter = 0
@@ -500,7 +501,7 @@ class VideoTracker:
         search_radius = 40 + self.consecutive_failures * 20
         t = self.current_frame_idx / self.fps
 
-        # Track each dot independently
+        # Track each dot independently via template matching
         new_positions = []
         any_fail = False
         for i in range(self.n_dots):
@@ -515,7 +516,48 @@ class VideoTracker:
             else:
                 new_positions.append(new_pos)
 
-        if any_fail:
+        track_ok = not any_fail
+        if track_ok:
+            # Refine centroids, then reject if any dot made an excessive jump
+            refined = [refine_centroid(frame, gray, p, self.test_type, 24)
+                       for p in new_positions]
+            max_jump = 0.0
+            for i in range(self.n_dots):
+                dx = refined[i][0] - self.dots[i][0]
+                dy = refined[i][1] - self.dots[i][1]
+                max_jump = max(max_jump, float(np.sqrt(dx * dx + dy * dy)))
+            if max_jump > search_radius * 0.8:
+                track_ok = False
+            else:
+                new_positions = refined
+
+        # Fallback: if template tracking has failed for a few frames, run the
+        # full initial detector to re-acquire the dot(s) after a large jump.
+        if not track_ok and self.consecutive_failures >= 2:
+            redetected = self._try_redetect(frame, gray)
+            if redetected is not None:
+                refined = [refine_centroid(frame, gray, p, self.test_type, 24)
+                           for p in redetected]
+                self.dots = refined
+                # Refresh templates from the re-acquired positions
+                self.templates = [extract_template(gray, d, 40)
+                                  for d in self.dots]
+                self.consecutive_failures = 0
+                self._template_update_counter = 0
+                self.redetections += 1
+
+                if self.n_dots >= 2:
+                    px_dist = self._dot_distance_px()
+                    dist = (px_dist / self.px_per_mm
+                            if self.px_per_mm else px_dist)
+                else:
+                    dist = None
+                self.results.append((t, dist))
+                self.positions.append(list(self.dots))
+                self.frame_indices.append(self.current_frame_idx)
+                return self._annotate(frame)
+
+        if not track_ok:
             self.consecutive_failures += 1
             if self.consecutive_failures > 60:
                 self.error = f"Lost tracking at {t:.1f}s"
@@ -527,27 +569,7 @@ class VideoTracker:
             self.frame_indices.append(self.current_frame_idx)
             return self._annotate(frame)
 
-        # Refine centroids
-        new_positions = [
-            refine_centroid(frame, gray, p, self.test_type, 24)
-            for p in new_positions
-        ]
-
-        # Reject excessive jumps
-        max_jump = 0
-        for i in range(self.n_dots):
-            dx = new_positions[i][0] - self.dots[i][0]
-            dy = new_positions[i][1] - self.dots[i][1]
-            jump = np.sqrt(dx * dx + dy * dy)
-            max_jump = max(max_jump, jump)
-
-        if max_jump > search_radius * 0.8:
-            self.consecutive_failures += 1
-            self.results.append((t, self.results[-1][1]))
-            self.positions.append(list(self.dots))
-            self.frame_indices.append(self.current_frame_idx)
-            return self._annotate(frame)
-
+        # Tracking succeeded normally
         self.consecutive_failures = 0
         self.dots = new_positions
 
@@ -568,6 +590,42 @@ class VideoTracker:
         self.positions.append(list(self.dots))
         self.frame_indices.append(self.current_frame_idx)
         return self._annotate(frame)
+
+    def _try_redetect(self, frame, gray):
+        """
+        Run the full initial-dot detector on the current frame to re-acquire
+        dots after template tracking fails. Matches detected candidates to
+        existing dot identities by proximity to the last known positions,
+        rejecting matches that are absurdly far (>200 + 60 * failures px).
+
+        Returns a list of positions (one per existing dot), or None on failure.
+        """
+        detected = find_initial_dots(frame, self.test_type)
+        if not detected:
+            return None
+
+        # Max acceptable displacement grows with how long we've been lost.
+        max_d = 200.0 + self.consecutive_failures * 60.0
+        max_d2 = max_d * max_d
+
+        remaining = list(detected)
+        new_positions = [None] * self.n_dots
+
+        for i in range(self.n_dots):
+            last = self.dots[i]
+            best_k, best_d2 = None, float('inf')
+            for k, cand in enumerate(remaining):
+                dx = cand[0] - last[0]
+                dy = cand[1] - last[1]
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_k = k
+            if best_k is None or best_d2 > max_d2:
+                return None
+            new_positions[i] = remaining.pop(best_k)
+
+        return new_positions
 
     def release(self):
         if self.cap is not None and self.cap.isOpened():
@@ -604,6 +662,8 @@ class VideoTracker:
                  f"{self.test_type}"]
         if self.initial_distance_mm:
             parts.append(f"cal: {self.initial_distance_mm} mm")
+        if self.redetections:
+            parts.append(f"relocks: {self.redetections}")
         return "  |  ".join(parts)
 
     def save_csv(self, path, results=None, positions=None,
