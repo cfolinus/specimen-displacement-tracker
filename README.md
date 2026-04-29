@@ -12,8 +12,9 @@ Automated displacement measurement tool for Instron tensile test videos. Tracks 
 
 **2. Install dependencies** — open a terminal and run:
 ```
-pip install opencv-python numpy matplotlib pillow xlsxwriter
+pip install opencv-python numpy matplotlib pillow xlsxwriter pywin32
 ```
+(`pywin32` is Windows-only and enables "Copy plot to clipboard" — everything else works without it.)
 
 **3. Run the tracker:**
 - Double-click `Launch Tracker.bat`, or
