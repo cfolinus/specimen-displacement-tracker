@@ -5,8 +5,8 @@ Supports two test types, auto-detected from the filename:
   - "tensile": two dark Sharpie dots on a bright specimen between jaws
   - "roller":  one or two bright magenta paint-pen dots on a grey mechanism
 
-The tracker stores a variable number of dots (1 or 2) per video and
-computes inter-dot distance only when there are at least 2 dots.
+The tracker stores a variable number of dots (1 to 4) per video and
+computes inter-dot distance only when there are exactly 2 dots.
 """
 
 import cv2
@@ -23,13 +23,25 @@ def extract_initial_distance_mm(filename):
     return float(match.group(1)) if match else None
 
 
+VALID_TEST_TYPES = ('tensile', 'roller', 'hinge')
+
+
 def detect_test_type(filename):
-    """Infer test type from filename. Returns 'tensile' or 'roller'."""
+    """Infer test type from filename.
+
+    Returns one of VALID_TEST_TYPES if the filename contains that keyword
+    (case-insensitive), or None if no recognized keyword is present. There is
+    no silent default: callers should refuse to process a None-typed video so
+    the user can correct the filename rather than get the wrong detector.
+    """
     name = Path(filename).stem.lower()
     if 'roller' in name:
         return 'roller'
-    # Default to tensile (includes "Tensile", "Instron - side", anything else)
-    return 'tensile'
+    if 'hinge' in name:
+        return 'hinge'
+    if 'tensile' in name:
+        return 'tensile'
+    return None
 
 
 # ── Tensile: specimen region + dark Sharpie dot detection ───────────────────
@@ -78,10 +90,10 @@ def find_specimen_region(gray):
     return best
 
 
-def find_initial_dots_tensile(gray):
+def find_initial_dots_tensile(gray, max_dots=4):
     """
-    Find exactly 2 dark Sharpie dots on a light specimen in the first frame.
-    Returns [(x_bottom, y_bottom), (x_top, y_top)] or None.
+    Find up to `max_dots` dark Sharpie dots on a light specimen in the
+    first frame. Returns a list of (x, y) sorted bottom-to-top, or None.
     """
     h, w = gray.shape
 
@@ -166,30 +178,26 @@ def find_initial_dots_tensile(gray):
     if len(clusters) < 2:
         return None
 
+    # Greedily select up to `max_dots` highest-scoring clusters that are
+    # each vertically separated (>= 50px) from every already-selected dot,
+    # then return them sorted bottom-to-top (dot1 = bottom).
     clusters.sort(key=lambda c: c[4], reverse=True)
-    best_pair = None
-    best_pair_score = 0
-    for i in range(min(len(clusters), 8)):
-        for j in range(i + 1, min(len(clusters), 8)):
-            dy = abs(clusters[i][1] - clusters[j][1])
-            if dy < 50:
-                continue
-            pair_score = clusters[i][4] + clusters[j][4]
-            if pair_score > best_pair_score:
-                best_pair_score = pair_score
-                c1, c2 = clusters[i], clusters[j]
-                # Return [bottom (larger y), top (smaller y)]
-                if c1[1] > c2[1]:
-                    best_pair = [(c1[0], c1[1]), (c2[0], c2[1])]
-                else:
-                    best_pair = [(c2[0], c2[1]), (c1[0], c1[1])]
-    return best_pair
+    selected = []
+    for cl in clusters:
+        if len(selected) >= max_dots:
+            break
+        if all(abs(cl[1] - s[1]) >= 50 for s in selected):
+            selected.append(cl)
+    if len(selected) < 2:
+        return None
+    selected.sort(key=lambda c: c[1], reverse=True)  # bottom (larger y) first
+    return [(c[0], c[1]) for c in selected]
 
 
 # ── Roller: bright magenta paint-pen dot detection ──────────────────────────
-def find_initial_dots_roller(bgr, max_dots=2):
+def find_initial_dots_roller(bgr, max_dots=4):
     """
-    Find 1 or 2 bright magenta paint-pen dots on a grey mechanism.
+    Find up to `max_dots` bright magenta paint-pen dots on a grey mechanism.
 
     Returns list of positions sorted bottom-to-top (dots[0] = dot1 = bottom),
     or None if no confident dot is found.
@@ -249,12 +257,14 @@ def find_initial_dots_roller(bgr, max_dots=2):
     top = candidates[0]
     dots = [(top[0], top[1])]
 
-    # Accept a second dot only if its score is comparable and it's well-separated
-    for cand in candidates[1:max_dots]:
-        dx = cand[0] - top[0]
-        dy = cand[1] - top[1]
-        separation = np.sqrt(dx * dx + dy * dy)
-        if cand[4] > 0.6 * top[4] and separation > 100:
+    # Accept further dots only if their score is comparable and they are
+    # well-separated (>100px) from every dot already accepted.
+    for cand in candidates[1:]:
+        if len(dots) >= max_dots:
+            break
+        if cand[4] <= 0.6 * top[4]:
+            continue
+        if all(np.hypot(cand[0] - dx, cand[1] - dy) > 100 for dx, dy in dots):
             dots.append((cand[0], cand[1]))
 
     # Sort bottom-to-top (larger y = bottom on screen)
@@ -262,11 +272,106 @@ def find_initial_dots_roller(bgr, max_dots=2):
     return dots
 
 
+# ── Hinge: green/yellow paint-dot detection ──────────────────────────────────
+# Green dots are bright and well-saturated; yellow dots are dimmer and sit at a
+# slightly lower hue. Thresholds give margin above the dim yellow dots while
+# excluding metal hardware (screw heads etc.) with a similar but darker, less
+# saturated yellow-brown tint (H~20, S~88, V~92).
+GREEN_H = (45, 85)
+GREEN_S = 70
+GREEN_V = 70
+YELLOW_H = (33, 44)
+YELLOW_S = 100
+YELLOW_V = 110
+
+
+def _maybe_split_blobs(blobs, lab, max_dots):
+    """
+    If fewer than `max_dots` blobs were found and the largest one is
+    oversized (likely two dots merged together), erode its mask until it
+    splits into two components and use their centroids.
+    """
+    if len(blobs) >= max_dots or len(blobs) == 0:
+        return blobs
+
+    blobs_sorted = sorted(blobs, key=lambda b: b[2], reverse=True)
+    largest = blobs_sorted[0]
+    area, label_id = largest[2], largest[3]
+    if area < 250:
+        return blobs
+
+    mask = (lab == label_id).astype(np.uint8)
+    for k in range(1, 5):
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+        eroded = cv2.erode(mask, kernel)
+        n_e, e_lab, e_stats, e_cent = cv2.connectedComponentsWithStats(eroded)
+        valid = [i for i in range(1, n_e) if e_stats[i, cv2.CC_STAT_AREA] >= 2]
+        if len(valid) == 2:
+            new_blobs = [b for b in blobs if b[3] != label_id]
+            for i in valid:
+                cx, cy = e_cent[i]
+                new_blobs.append([float(cx), float(cy), area // 2, label_id])
+            return new_blobs
+        if len(valid) > 2:
+            break
+
+    return blobs
+
+
+def _find_color_dots(hsv, h_lo, h_hi, s_min, v_min, max_dots):
+    """Find up to `max_dots` blobs within the given HSV range, sorted
+    top-to-bottom (smaller y first)."""
+    h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    mask = ((h_ch >= h_lo) & (h_ch <= h_hi) &
+            (s_ch >= s_min) & (v_ch >= v_min)).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    n_labels, labels, stats, cents = cv2.connectedComponentsWithStats(mask)
+
+    blobs = []
+    for i in range(1, n_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < 12 or area > 1500:
+            continue
+        bw, bh = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+        aspect = bw / max(bh, 1)
+        if aspect < 0.3 or aspect > 3.3:
+            continue
+        cx, cy = cents[i]
+        blobs.append([float(cx), float(cy), int(area), i])
+
+    blobs = _maybe_split_blobs(blobs, labels, max_dots)
+
+    blobs.sort(key=lambda b: b[2], reverse=True)
+    blobs = blobs[:max_dots]
+    blobs.sort(key=lambda b: b[1])  # top-to-bottom
+    return [(b[0], b[1]) for b in blobs]
+
+
+def find_initial_dots_color(bgr, max_per_color=2):
+    """
+    Find up to `max_per_color` green dots and `max_per_color` yellow dots.
+
+    Returns a list of ((x, y), color) tuples — green dots first (top-to-
+    bottom), then yellow dots (top-to-bottom) — or None if neither color
+    was found.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    greens = _find_color_dots(hsv, *GREEN_H, GREEN_S, GREEN_V, max_per_color)
+    yellows = _find_color_dots(hsv, *YELLOW_H, YELLOW_S, YELLOW_V, max_per_color)
+    if not greens and not yellows:
+        return None
+    return [(p, 'green') for p in greens] + [(p, 'yellow') for p in yellows]
+
+
 # ── Unified initial detection ───────────────────────────────────────────────
 def find_initial_dots(frame_bgr, test_type='tensile'):
     """Dispatch to the right detection for the given test type."""
     if test_type == 'roller':
         return find_initial_dots_roller(frame_bgr)
+    if test_type == 'hinge':
+        labeled = find_initial_dots_color(frame_bgr)
+        return [p for p, _c in labeled] if labeled else None
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     return find_initial_dots_tensile(gray)
 
@@ -379,10 +484,46 @@ def refine_centroid_bright(bgr, pos, patch_size=30):
     return (cx, cy)
 
 
-def refine_centroid(frame_bgr, gray, pos, test_type='tensile', patch_size=30):
+def refine_centroid_color(bgr, pos, color, patch_size=30):
+    """
+    Snap to the centroid of a green or yellow paint dot near `pos`.
+    Uses saturation weighting within the dot's own hue range.
+    """
+    h, w = bgr.shape[:2]
+    half = patch_size
+    x, y = int(pos[0]), int(pos[1])
+    x1, y1 = max(0, x - half), max(0, y - half)
+    x2, y2 = min(w, x + half), min(h, y + half)
+
+    patch = bgr[y1:y2, x1:x2]
+    if patch.size == 0:
+        return pos
+
+    hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    h_ch = hsv_patch[:, :, 0]
+    s_ch = hsv_patch[:, :, 1].astype(float)
+
+    h_lo, h_hi = GREEN_H if color == 'green' else YELLOW_H
+    hue_ok = ((h_ch >= h_lo) & (h_ch <= h_hi)).astype(float)
+    weights = s_ch * hue_ok
+    total = weights.sum()
+    if total < 30:
+        return pos  # not enough of this color found
+
+    yy, xx = np.mgrid[0:patch.shape[0], 0:patch.shape[1]]
+    cx = (xx * weights).sum() / total + x1
+    cy = (yy * weights).sum() / total + y1
+    return (cx, cy)
+
+
+def refine_centroid(frame_bgr, gray, pos, test_type='tensile', patch_size=30, color=None):
     """Dispatch to the right refinement for the test type."""
     if test_type == 'roller':
         return refine_centroid_bright(frame_bgr, pos, patch_size)
+    if test_type == 'hinge':
+        # Hinge dots sit close together (~30px); cap the patch so the
+        # centroid doesn't bleed into a neighboring dot of the same color.
+        return refine_centroid_color(frame_bgr, pos, color or 'green', min(patch_size, 10))
     return refine_centroid_dark(gray, pos, patch_size)
 
 
@@ -400,7 +541,7 @@ def extract_template(gray, center, patch_size=40):
 class VideoTracker:
     """
     Stateful tracker that processes one frame at a time. Handles
-    variable dot count (1 or 2) for tensile or roller test videos.
+    variable dot count (1 to 4) for tensile, roller, or hinge test videos.
     """
 
     def __init__(self, video_path, frame_skip=1,
@@ -419,6 +560,7 @@ class VideoTracker:
 
         # Current state — lists indexed by dot (0 = dot1/bottom, 1 = dot2/top)
         self.dots = []               # [(x, y), ...]
+        self.colors = []             # [None, ...] or ['green', 'green', 'yellow', 'yellow'] for hinge
         self.templates = []
         self.ref_templates = []
         self.n_dots = 0
@@ -437,6 +579,15 @@ class VideoTracker:
     # ---- public API ----
     def open(self):
         """Open video and detect dots in the first frame."""
+        if self.test_type is None:
+            self.error = (
+                f"Could not determine test type for '{self.video_path.name}'. "
+                f"Include one of these keywords in the filename: "
+                f"{', '.join(VALID_TEST_TYPES)}."
+            )
+            self.finished = True
+            return None
+
         self.cap = cv2.VideoCapture(str(self.video_path))
         if not self.cap.isOpened():
             self.error = f"Cannot open video: {self.video_path.name}"
@@ -455,24 +606,36 @@ class VideoTracker:
             return None
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detected = find_initial_dots(frame, self.test_type)
-        if detected is None or len(detected) < 1:
-            self.error = f"Could not detect any dots ({self.test_type})"
-            self.finished = True
-            return None
+
+        if self.test_type == 'hinge':
+            labeled = find_initial_dots_color(frame)
+            if not labeled:
+                self.error = f"Could not detect any dots ({self.test_type})"
+                self.finished = True
+                return None
+            detected = [p for p, _c in labeled]
+            self.colors = [c for _p, c in labeled]
+        else:
+            detected = find_initial_dots(frame, self.test_type)
+            if detected is None or len(detected) < 1:
+                self.error = f"Could not detect any dots ({self.test_type})"
+                self.finished = True
+                return None
+            self.colors = [None] * len(detected)
 
         # Refine each dot
-        self.dots = [refine_centroid(frame, gray, d, self.test_type)
-                     for d in detected]
+        self.dots = [refine_centroid(frame, gray, d, self.test_type, color=c)
+                     for d, c in zip(detected, self.colors)]
         self.n_dots = len(self.dots)
 
         # Templates (grayscale template matching works for both dot types)
         self.templates = [extract_template(gray, d, 40) for d in self.dots]
         self.ref_templates = [t.copy() for t in self.templates]
 
-        # Calibration (only if 2 dots and filename provides initial distance)
+        # Calibration + inter-dot distance only make sense for exactly 2 dots.
+        # With 3+ dots we track positions only (no inter-dot output).
         dist = None
-        if self.n_dots >= 2:
+        if self.n_dots == 2:
             init_px = self._dot_distance_px()
             if self.initial_distance_mm is not None:
                 self.px_per_mm = init_px / self.initial_distance_mm
@@ -519,8 +682,8 @@ class VideoTracker:
         track_ok = not any_fail
         if track_ok:
             # Refine centroids, then reject if any dot made an excessive jump
-            refined = [refine_centroid(frame, gray, p, self.test_type, 24)
-                       for p in new_positions]
+            refined = [refine_centroid(frame, gray, p, self.test_type, 24, color=c)
+                       for p, c in zip(new_positions, self.colors)]
             max_jump = 0.0
             for i in range(self.n_dots):
                 dx = refined[i][0] - self.dots[i][0]
@@ -536,8 +699,8 @@ class VideoTracker:
         if not track_ok and self.consecutive_failures >= 2:
             redetected = self._try_redetect(frame, gray)
             if redetected is not None:
-                refined = [refine_centroid(frame, gray, p, self.test_type, 24)
-                           for p in redetected]
+                refined = [refine_centroid(frame, gray, p, self.test_type, 24, color=c)
+                           for p, c in zip(redetected, self.colors)]
                 self.dots = refined
                 # Refresh templates from the re-acquired positions
                 self.templates = [extract_template(gray, d, 40)
@@ -546,7 +709,7 @@ class VideoTracker:
                 self._template_update_counter = 0
                 self.redetections += 1
 
-                if self.n_dots >= 2:
+                if self.n_dots == 2:
                     px_dist = self._dot_distance_px()
                     dist = (px_dist / self.px_per_mm
                             if self.px_per_mm else px_dist)
@@ -579,8 +742,8 @@ class VideoTracker:
             self._template_update_counter = 0
             self.templates = [extract_template(gray, d, 40) for d in self.dots]
 
-        # Inter-dot distance (only if 2+ dots)
-        if self.n_dots >= 2:
+        # Inter-dot distance (only if exactly 2 dots)
+        if self.n_dots == 2:
             px_dist = self._dot_distance_px()
             dist = px_dist / self.px_per_mm if self.px_per_mm else px_dist
         else:
@@ -600,13 +763,40 @@ class VideoTracker:
 
         Returns a list of positions (one per existing dot), or None on failure.
         """
-        detected = find_initial_dots(frame, self.test_type)
-        if not detected:
-            return None
-
         # Max acceptable displacement grows with how long we've been lost.
         max_d = 200.0 + self.consecutive_failures * 60.0
         max_d2 = max_d * max_d
+
+        if self.test_type == 'hinge':
+            labeled = find_initial_dots_color(frame)
+            if not labeled:
+                return None
+            # Group candidates by color so identities can't swap between
+            # green and yellow dots.
+            remaining = {'green': [], 'yellow': []}
+            for p, c in labeled:
+                remaining[c].append(p)
+
+            new_positions = [None] * self.n_dots
+            for i in range(self.n_dots):
+                last = self.dots[i]
+                cands = remaining.get(self.colors[i], [])
+                best_k, best_d2 = None, float('inf')
+                for k, cand in enumerate(cands):
+                    dx = cand[0] - last[0]
+                    dy = cand[1] - last[1]
+                    d2 = dx * dx + dy * dy
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best_k = k
+                if best_k is None or best_d2 > max_d2:
+                    return None
+                new_positions[i] = cands.pop(best_k)
+            return new_positions
+
+        detected = find_initial_dots(frame, self.test_type)
+        if not detected:
+            return None
 
         remaining = list(detected)
         new_positions = [None] * self.n_dots
@@ -639,8 +829,17 @@ class VideoTracker:
         dy = self.dots[0][1] - self.dots[1][1]
         return float(np.sqrt(dx * dx + dy * dy))
 
+    def _dot_label(self, i):
+        """Label for dot index i: 'green1'/'yellow2' for hinge mode (1-indexed
+        within each color), or 'dot{i+1}' otherwise."""
+        if self.colors and i < len(self.colors) and self.colors[i]:
+            color = self.colors[i]
+            nth = sum(1 for j in range(i + 1) if self.colors[j] == color)
+            return f'{color}{nth}'
+        return f'dot{i+1}'
+
     def _annotate(self, frame):
-        dist_val = self.results[-1][1] if (self.results and self.n_dots >= 2) else None
+        dist_val = self.results[-1][1] if (self.results and self.n_dots == 2) else None
         return annotate_frame(frame, self.dots, dist_val, self.unit)
 
     @property
@@ -693,20 +892,20 @@ class VideoTracker:
         # ── Build header ────────────────────────────────────────────────
         header = ['time_s']
         for i in range(n):
-            lbl = f'dot{i+1}'
+            lbl = self._dot_label(i)
             if track_pixel_pos:
                 header += [f'{lbl}_x_px', f'{lbl}_y_px']
         for i in range(n):
-            lbl = f'dot{i+1}'
+            lbl = self._dot_label(i)
             if track_mm_pos:
                 header += [f'{lbl}_x_mm', f'{lbl}_y_mm']
         for i in range(n):
-            lbl = f'dot{i+1}'
+            lbl = self._dot_label(i)
             if track_dot_disp:
                 header += [f'{lbl}_dx_{unit}', f'{lbl}_dy_{unit}']
-        if track_interdot_disp and n >= 2:
+        if track_interdot_disp and n == 2:
             header.append(f'displacement_{unit}')
-        if track_interdot_dist and n >= 2:
+        if track_interdot_dist and n == 2:
             header.append(f'distance_{unit}')
 
         with open(path, 'w', newline='') as f:
@@ -753,12 +952,12 @@ class VideoTracker:
                             row += ['', '']
 
                 # Inter-dot displacement / distance
-                if track_interdot_disp and n >= 2:
+                if track_interdot_disp and n == 2:
                     if d is not None and d0 is not None:
                         row.append(f'{d - d0:.4f}')
                     else:
                         row.append('')
-                if track_interdot_dist and n >= 2:
+                if track_interdot_dist and n == 2:
                     row.append(f'{d:.4f}' if d is not None else '')
 
                 writer.writerow(row)
@@ -777,15 +976,15 @@ def annotate_frame(frame, dots, dist_val=None, unit="px"):
 
     overlay = vis.copy()
     sz = 18
-    color = (0, 255, 0)
+    color = (255, 0, 0)  # bright blue (BGR)
     for d in valid_dots:
         pt = (int(d[0]), int(d[1]))
         cv2.line(overlay, (pt[0] - sz, pt[1]), (pt[0] + sz, pt[1]), color, 2)
         cv2.line(overlay, (pt[0], pt[1] - sz), (pt[0], pt[1] + sz), color, 2)
         cv2.circle(overlay, pt, 12, color, 2)
 
-    # Connect dot1 and dot2 if both present
-    if len(dots) >= 2 and dots[0] is not None and dots[1] is not None:
+    # Connect dot1 and dot2 only when there are exactly two dots
+    if len(dots) == 2 and dots[0] is not None and dots[1] is not None:
         pt1 = (int(dots[0][0]), int(dots[0][1]))
         pt2 = (int(dots[1][0]), int(dots[1][1]))
         cv2.line(overlay, pt1, pt2, (0, 200, 255), 1, cv2.LINE_AA)
@@ -793,7 +992,7 @@ def annotate_frame(frame, dots, dist_val=None, unit="px"):
     cv2.addWeighted(overlay, 0.5, vis, 0.5, 0, vis)
 
     # Distance label between the two dots
-    if dist_val is not None and len(dots) >= 2 and dots[0] is not None and dots[1] is not None:
+    if dist_val is not None and len(dots) == 2 and dots[0] is not None and dots[1] is not None:
         pt1 = (int(dots[0][0]), int(dots[0][1]))
         pt2 = (int(dots[1][0]), int(dots[1][1]))
         label = f"{dist_val:.2f} {unit}"

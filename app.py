@@ -623,7 +623,7 @@ class App(tk.Tk):
 
         # Decide what signal to clean on: inter-dot distance for 2+ dots,
         # else dot1's y-coordinate (the primary motion axis).
-        if tracker.n_dots >= 2 and all(r[1] is not None for r in tracker.results):
+        if tracker.n_dots == 2 and all(r[1] is not None for r in tracker.results):
             signal = np.array([r[1] for r in tracker.results])
         else:
             signal = np.array([
@@ -673,19 +673,22 @@ class App(tk.Tk):
 
         if opts['track_pixel_pos']:
             for i in range(n):
-                add_col(f'Dot{i+1} X (px)', 100)
-                add_col(f'Dot{i+1} Y (px)', 100)
+                lbl = tracker._dot_label(i).capitalize()
+                add_col(f'{lbl} X (px)', 100)
+                add_col(f'{lbl} Y (px)', 100)
         if opts['track_mm_pos']:
             for i in range(n):
-                add_col(f'Dot{i+1} X (mm)')
-                add_col(f'Dot{i+1} Y (mm)')
+                lbl = tracker._dot_label(i).capitalize()
+                add_col(f'{lbl} X (mm)')
+                add_col(f'{lbl} Y (mm)')
         if opts['track_dot_disp']:
             for i in range(n):
-                add_col(f'Dot{i+1} dX ({unit})')
-                add_col(f'Dot{i+1} dY ({unit})')
-        if opts['track_interdot_disp'] and n >= 2:
+                lbl = tracker._dot_label(i).capitalize()
+                add_col(f'{lbl} dX ({unit})')
+                add_col(f'{lbl} dY ({unit})')
+        if opts['track_interdot_disp'] and n == 2:
             add_col(f'Displacement ({unit})', 130)
-        if opts['track_interdot_dist'] and n >= 2:
+        if opts['track_interdot_dist'] and n == 2:
             add_col(f'Distance ({unit})', 120)
 
         self.tree['columns'] = col_ids
@@ -752,12 +755,12 @@ class App(tk.Tk):
                         row += ['', '']
 
             # Inter-dot displacement / distance
-            if opts['track_interdot_disp'] and n >= 2:
+            if opts['track_interdot_disp'] and n == 2:
                 if d is not None and d0 is not None:
                     row.append(f'{d - d0:.4f}')
                 else:
                     row.append('')
-            if opts['track_interdot_dist'] and n >= 2:
+            if opts['track_interdot_dist'] and n == 2:
                 row.append(f'{d:.4f}' if d is not None else '')
 
             self.tree.insert('', 'end', values=row)
@@ -770,14 +773,17 @@ class App(tk.Tk):
         unit = tracker.unit
         has_mm = tracker.px_per_mm is not None
 
-        for i in range(1, n + 1):
-            labels += [f'Dot{i} X (px)', f'Dot{i} Y (px)']
+        for i in range(n):
+            lbl = tracker._dot_label(i).capitalize()
+            labels += [f'{lbl} X (px)', f'{lbl} Y (px)']
         if has_mm:
-            for i in range(1, n + 1):
-                labels += [f'Dot{i} X (mm)', f'Dot{i} Y (mm)']
-        for i in range(1, n + 1):
-            labels += [f'Dot{i} dX ({unit})', f'Dot{i} dY ({unit})']
-        if n >= 2:
+            for i in range(n):
+                lbl = tracker._dot_label(i).capitalize()
+                labels += [f'{lbl} X (mm)', f'{lbl} Y (mm)']
+        for i in range(n):
+            lbl = tracker._dot_label(i).capitalize()
+            labels += [f'{lbl} dX ({unit})', f'{lbl} dY ({unit})']
+        if n == 2:
             labels.append(f'Inter-dot displacement ({unit})')
             labels.append(f'Inter-dot distance ({unit})')
         return labels
@@ -785,9 +791,10 @@ class App(tk.Tk):
     def _default_y_label(self, tracker):
         """Sensible default Y variable for this tracker."""
         unit = tracker.unit
-        if tracker.n_dots >= 2:
+        if tracker.n_dots == 2:
             return f'Inter-dot displacement ({unit})'
-        return f'Dot1 dY ({unit})'
+        lbl = tracker._dot_label(0).capitalize()
+        return f'{lbl} dY ({unit})'
 
     def _compute_var(self, tracker, label, results, positions):
         """Return a numpy array of values for `label` over the given rows."""
@@ -811,35 +818,38 @@ class App(tk.Tk):
                 [r[1] if r[1] is not None else np.nan for r in results],
                 dtype=float)
 
-        # Dot-indexed: 'Dot1 X (px)', 'Dot2 dY (mm)', etc.
-        if label.startswith('Dot'):
+        # Dot-indexed: 'Dot1 X (px)', 'Green2 dY (mm)', etc.
+        if ' ' in label:
             space = label.index(' ')
-            i = int(label[3:space]) - 1
+            prefix = label[:space]
             rest = label[space + 1:]
-            ref_p = (ref[i] if (0 <= i < len(ref) and ref[i] is not None)
-                     else None)
+            i = next((k for k in range(n)
+                      if tracker._dot_label(k).capitalize() == prefix), None)
+            if i is not None:
+                ref_p = (ref[i] if (0 <= i < len(ref) and ref[i] is not None)
+                         else None)
 
-            out = np.full(len(positions), np.nan, dtype=float)
-            for k, pts in enumerate(positions):
-                p = pts[i] if (pts and i < len(pts) and pts[i] is not None) \
-                    else None
-                if p is None:
-                    continue
-                if rest == 'X (px)':
-                    out[k] = p[0]
-                elif rest == 'Y (px)':
-                    out[k] = h - p[1]
-                elif rest == 'X (mm)' and ppm:
-                    out[k] = p[0] / ppm
-                elif rest == 'Y (mm)' and ppm:
-                    out[k] = (h - p[1]) / ppm
-                elif rest.startswith('dX') and ref_p is not None:
-                    v = p[0] - ref_p[0]
-                    out[k] = v / ppm if ('(mm)' in rest and ppm) else v
-                elif rest.startswith('dY') and ref_p is not None:
-                    v = (h - p[1]) - (h - ref_p[1])
-                    out[k] = v / ppm if ('(mm)' in rest and ppm) else v
-            return out
+                out = np.full(len(positions), np.nan, dtype=float)
+                for k, pts in enumerate(positions):
+                    p = pts[i] if (pts and i < len(pts) and pts[i] is not None) \
+                        else None
+                    if p is None:
+                        continue
+                    if rest == 'X (px)':
+                        out[k] = p[0]
+                    elif rest == 'Y (px)':
+                        out[k] = h - p[1]
+                    elif rest == 'X (mm)' and ppm:
+                        out[k] = p[0] / ppm
+                    elif rest == 'Y (mm)' and ppm:
+                        out[k] = (h - p[1]) / ppm
+                    elif rest.startswith('dX') and ref_p is not None:
+                        v = p[0] - ref_p[0]
+                        out[k] = v / ppm if ('(mm)' in rest and ppm) else v
+                    elif rest.startswith('dY') and ref_p is not None:
+                        v = (h - p[1]) - (h - ref_p[1])
+                        out[k] = v / ppm if ('(mm)' in rest and ppm) else v
+                return out
 
         return np.full(len(positions), np.nan, dtype=float)
 
