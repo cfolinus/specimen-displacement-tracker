@@ -19,7 +19,7 @@ import numpy as np
 # --- Tunable settings (the things we'll revisit later live here) ----------------
 SATURATION_SCALE = 1.8    # multiply the HSV S channel by this (>1 = more saturated)
 
-INPUT_DIR = Path("input_videos/2026-06-11 Videos")
+INPUT_DIR = Path("input_videos/2026-06-14 Videos")
 OUTPUT_DIR = INPUT_DIR / "Edited"
 
 # Crop box as (x, y, width, height) in pixels, applied to every video in the batch.

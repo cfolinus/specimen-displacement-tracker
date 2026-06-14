@@ -10,7 +10,8 @@ The tracker selects which kind of video it's looking at from a **keyword in the 
 |---|---|---|---|
 | **tensile** | filename contains `tensile` | 2 dark Sharpie dots on a bright specimen, stretched **vertically** between Instron jaws. Specimen must be brighter than the jaws; dots must be ≥50px apart vertically. | px and/or mm (if filename has `<number>mm`), inter-dot distance/displacement |
 | **roller** | filename contains `roller` | 1–2 bright magenta paint-pen dots on a grey mechanism | px and/or mm, per-dot displacement |
-| **hinge** | filename contains `hinge` | 2 green + 2 yellow paint dots on a hinge mechanism, tracked **independently**, labeled `green1/green2/yellow1/yellow2` | px only (no mm calibration, no inter-dot distance) |
+| **hinge** | filename contains `hinge` (but not `hinge colored`/`hinge-colored`/`hinge_colored`) | Two rows of up to 4 small black marker dots, one row per coupler bar of a hinge mechanism, tracked **independently**, labeled `set1_1...set1_4/set2_1...set2_4` (3 dots accepted per set if the faint 4th can't be found) | px only (no mm calibration, no inter-dot distance) |
+| **hinge_colored** | filename contains `hinge colored`, `hinge-colored`, or `hinge_colored` | 2 green + 2 yellow paint dots on a hinge mechanism, tracked **independently**, labeled `green1/green2/yellow1/yellow2` | px only (no mm calibration, no inter-dot distance) |
 
 Tracking overlays (crosshairs/circles) are drawn in **bright blue**.
 
@@ -35,7 +36,8 @@ pip install opencv-python numpy matplotlib pillow xlsxwriter pywin32
 ## Usage
 
 1. Place `.MOV` (or `.mp4`, `.avi`) video files in `input_videos/`
-   - **Every filename must contain a test-type keyword** — `tensile`, `roller`, or `hinge` — or the video is skipped. e.g. `Tensile - Instron - side - 1 49.9mm.MOV`, `Roller test 3.MP4`, `Hinge sample 12.mp4`
+   - **Every filename must contain a test-type keyword** — `tensile`, `roller`, `hinge`, or `hinge colored` — or the video is skipped. e.g. `Tensile - Instron - side - 1 49.9mm.MOV`, `Roller test 3.MP4`, `Hinge sample 12.mp4`, `Hinge colored sample 12.mp4`
+   - A filename containing `hinge` alone selects the black-dot detector; `hinge colored` (or `hinge-colored`/`hinge_colored`) selects the green/yellow paint-dot detector
    - For **tensile**/**roller** videos with mm calibration, the filename **must** also contain the initial dot separation distance, e.g. `Tensile - Instron - side - 1 49.9mm.MOV`
 2. Click **Add from input_videos/** or **Add Videos...** to load files
 3. Choose a frame skip rate and click **Run All**
@@ -46,12 +48,12 @@ pip install opencv-python numpy matplotlib pillow xlsxwriter pywin32
 
 ## Features
 
-- **Automated dot detection** — tensile (dark Sharpie dots via annular contrast filtering + jaw-based specimen isolation), roller (bright magenta paint dots via HSV), and hinge (green/yellow paint dots via HSV, with merged-dot splitting)
+- **Automated dot detection** — tensile (dark Sharpie dots via annular contrast filtering + jaw-based specimen isolation), roller (bright magenta paint dots via HSV), hinge (two rows of small black marker dots via multi-threshold contrast + collinear-group fitting), and hinge_colored (green/yellow paint dots via HSV, with merged-dot splitting)
 - **Sub-pixel tracking** — adaptive blob-finding centroid refinement resists drift during large specimen stretching or mechanism motion
 - **Batch processing** — processes multiple videos sequentially in a background thread
 - **Video review** — scrub through any completed video with annotated crosshair overlays (bright blue)
 - **Displacement output** — pixel-to-mm calibration from filename-encoded initial distance (tensile/roller); outputs displacement relative to frame 0
-- **Multi-dot tracking** — up to 4 dots tracked independently per video; hinge mode labels dots by color (`green1`, `green2`, `yellow1`, `yellow2`)
+- **Multi-dot tracking** — up to 8 dots tracked independently per video; hinge mode labels dots by set/position (`set1_1`...`set1_4`, `set2_1`...`set2_4`), hinge_colored mode labels dots by color (`green1`, `green2`, `yellow1`, `yellow2`)
 - **Data cleaning** — rolling median + MAD outlier removal
 - **CSV export** — auto-saves to `output_data/` on completion; manual export also available
 

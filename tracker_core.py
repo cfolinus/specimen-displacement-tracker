@@ -1,11 +1,15 @@
 """
-Core dot-tracking logic for Instron tensile and roller test videos.
+Core dot-tracking logic for Instron tensile, roller, and hinge test videos.
 
-Supports two test types, auto-detected from the filename:
-  - "tensile": two dark Sharpie dots on a bright specimen between jaws
-  - "roller":  one or two bright magenta paint-pen dots on a grey mechanism
+Supports several test types, auto-detected from the filename:
+  - "tensile":      two dark Sharpie dots on a bright specimen between jaws
+  - "roller":       one or two bright magenta paint-pen dots on a grey mechanism
+  - "hinge":        two sets of small black marker dots (up to 4 each) on the
+                    two coupler bars of a hinge mechanism
+  - "hinge_colored": 2 green + 2 yellow paint dots on a hinge mechanism
+                    (the original color-based hinge detector)
 
-The tracker stores a variable number of dots (1 to 4) per video and
+The tracker stores a variable number of dots (1 to 8) per video and
 computes inter-dot distance only when there are exactly 2 dots.
 """
 
@@ -23,7 +27,7 @@ def extract_initial_distance_mm(filename):
     return float(match.group(1)) if match else None
 
 
-VALID_TEST_TYPES = ('tensile', 'roller', 'hinge')
+VALID_TEST_TYPES = ('tensile', 'roller', 'hinge', 'hinge_colored')
 
 
 def detect_test_type(filename):
@@ -33,10 +37,16 @@ def detect_test_type(filename):
     (case-insensitive), or None if no recognized keyword is present. There is
     no silent default: callers should refuse to process a None-typed video so
     the user can correct the filename rather than get the wrong detector.
+
+    'hinge colored' / 'hinge-colored' / 'hinge_colored' selects the legacy
+    green/yellow paint-dot detector; plain 'hinge' selects the black-dot
+    detector (two sets of up to 4 small dark marker dots).
     """
     name = Path(filename).stem.lower()
     if 'roller' in name:
         return 'roller'
+    if 'hinge colored' in name or 'hinge-colored' in name or 'hinge_colored' in name:
+        return 'hinge_colored'
     if 'hinge' in name:
         return 'hinge'
     if 'tensile' in name:
@@ -364,14 +374,205 @@ def find_initial_dots_color(bgr, max_per_color=2):
     return [(p, 'green') for p in greens] + [(p, 'yellow') for p in yellows]
 
 
+# ── Hinge: small black marker-dot detection (two sets of up to 4) ───────────
+def _best_collinear_group(points, max_pts=4, min_pts=3,
+                           perp_tol=8.0, min_span=15.0, max_span=180.0):
+    """
+    Find the best-scoring group of `min_pts`-`max_pts` roughly-collinear
+    points — a row of marker dots on a hinge bar.
+
+    For every pair of points, treat them as defining a line and count how
+    many other points lie within `perp_tol` of it. The pair/line with the
+    most inliers (ties broken by total contrast) wins. If more than
+    `max_pts` points lie near the winning line, keep the `max_pts` closest
+    to it. Returns the winning list of points, or None if no pair yields
+    at least `min_pts` inliers.
+    """
+    best = None
+    best_score = (0, 0.0)
+    n = len(points)
+    for i in range(n):
+        for j in range(i + 1, n):
+            x1, y1, _ = points[i]
+            x2, y2, _ = points[j]
+            span = np.hypot(x2 - x1, y2 - y1)
+            if span < min_span or span > max_span:
+                continue
+            ux, uy = (x2 - x1) / span, (y2 - y1) / span
+            inliers = []
+            for p in points:
+                px, py, _ = p
+                vx, vy = px - x1, py - y1
+                perp = abs(vx * uy - vy * ux)
+                if perp <= perp_tol:
+                    inliers.append(p)
+            if len(inliers) < min_pts:
+                continue
+            if len(inliers) > max_pts:
+                inliers.sort(key=lambda p: abs((p[0] - x1) * uy - (p[1] - y1) * ux))
+                inliers = inliers[:max_pts]
+            score = (len(inliers), sum(p[2] for p in inliers))
+            if score > best_score:
+                best_score = score
+                best = inliers
+    return best
+
+
+def _merge_close_points(points, dist_thresh=10.0):
+    """
+    Single-linkage merge of (x, y, score) points within `dist_thresh` of
+    each other, repeated until stable. Each merged group becomes one point
+    at the centroid of its members, with the max score.
+    """
+    current = list(points)
+    while True:
+        merged = []
+        used = set()
+        changed = False
+        for i, c1 in enumerate(current):
+            if i in used:
+                continue
+            group = [c1]
+            used.add(i)
+            for j, c2 in enumerate(current):
+                if j in used:
+                    continue
+                if np.hypot(c1[0] - c2[0], c1[1] - c2[1]) < dist_thresh:
+                    group.append(c2)
+                    used.add(j)
+            if len(group) > 1:
+                changed = True
+            avg_x = np.mean([g[0] for g in group])
+            avg_y = np.mean([g[1] for g in group])
+            max_score = max(g[2] for g in group)
+            merged.append((avg_x, avg_y, max_score))
+        current = merged
+        if not changed:
+            return current
+
+
+def find_initial_dots_hinge_black(bgr, max_per_set=4):
+    """
+    Find up to two sets of `max_per_set` small black marker dots, one set
+    per coupler bar of the hinge mechanism.
+
+    Returns a list of ((x, y), group) tuples — 'set1' dots first (the
+    higher/upper bar, ordered left-to-right), then 'set2' dots — or None
+    if two collinear groups of at least 3 dots each could not be found.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    all_candidates = []
+    for thresh_val in range(90, 175, 5):
+        _, thresh = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY_INV)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < 6 or area > 150:
+                continue
+            x, y, bw, bh = cv2.boundingRect(c)
+            aspect = bw / max(bh, 1)
+            if aspect < 0.2 or aspect > 5.0:
+                continue
+            M = cv2.moments(c)
+            if M["m00"] == 0:
+                continue
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+
+            ix, iy = int(cx), int(cy)
+            inner_r, outer_r = 8, 22
+            y1, y2 = max(0, iy - outer_r), min(h, iy + outer_r)
+            x1, x2 = max(0, ix - outer_r), min(w, ix + outer_r)
+            patch = gray[y1:y2, x1:x2]
+
+            yy, xx = np.ogrid[-(iy - y1):(y2 - iy), -(ix - x1):(x2 - ix)]
+            dist = np.sqrt(xx.astype(float)**2 + yy.astype(float)**2)
+            ann = (dist > inner_r) & (dist <= outer_r)
+            if ann.sum() == 0:
+                continue
+
+            surround = patch[ann].mean()
+            center = gray[max(0, iy - 2):iy + 3, max(0, ix - 2):ix + 3].mean()
+            contrast = surround - center
+            if surround > 130 and contrast > 30:
+                all_candidates.append((cx, cy, contrast))
+
+    if len(all_candidates) < 3:
+        return None
+
+    # Cluster nearby detections (same physical dot found at multiple
+    # thresholds) and drop large/stable blobs (screws, hardware) that get
+    # detected at almost every threshold level.
+    clusters = []
+    used = set()
+    for i, c1 in enumerate(all_candidates):
+        if i in used:
+            continue
+        group = [c1]
+        used.add(i)
+        for j, c2 in enumerate(all_candidates):
+            if j in used:
+                continue
+            if np.hypot(c1[0] - c2[0], c1[1] - c2[1]) < 10:
+                group.append(c2)
+                used.add(j)
+        avg_x = np.mean([g[0] for g in group])
+        avg_y = np.mean([g[1] for g in group])
+        max_contrast = max(g[2] for g in group)
+        if len(group) <= 10:
+            clusters.append((avg_x, avg_y, max_contrast))
+
+    if len(clusters) < 3:
+        return None
+
+    # A second merge pass collapses near-duplicate cluster centroids that
+    # single-linkage chaining can leave behind (e.g. two sub-clusters of
+    # the same dot whose centroids end up a few px apart).
+    clusters = _merge_close_points(clusters, dist_thresh=10.0)
+    if len(clusters) < 3:
+        return None
+
+    remaining = list(clusters)
+    groups = []
+    for _ in range(2):
+        group = _best_collinear_group(remaining, max_per_set)
+        if group is None:
+            break
+        groups.append(group)
+        remaining = [p for p in remaining if p not in group]
+
+    if len(groups) < 2:
+        return None
+
+    # Order groups top-to-bottom (set1 = upper bar, set2 = lower bar), and
+    # dots within each group left-to-right (the faint 4th dot, if found,
+    # ends up last).
+    groups.sort(key=lambda g: np.mean([p[1] for p in g]))
+
+    labeled = []
+    for set_idx, group in enumerate(groups, start=1):
+        ordered = sorted(group, key=lambda p: p[0])
+        for p in ordered:
+            labeled.append(((p[0], p[1]), f'set{set_idx}'))
+    return labeled
+
+
 # ── Unified initial detection ───────────────────────────────────────────────
 def find_initial_dots(frame_bgr, test_type='tensile'):
     """Dispatch to the right detection for the given test type."""
     if test_type == 'roller':
         return find_initial_dots_roller(frame_bgr)
-    if test_type == 'hinge':
+    if test_type == 'hinge_colored':
         labeled = find_initial_dots_color(frame_bgr)
         return [p for p, _c in labeled] if labeled else None
+    if test_type == 'hinge':
+        labeled = find_initial_dots_hinge_black(frame_bgr)
+        return [p for p, _g in labeled] if labeled else None
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     return find_initial_dots_tensile(gray)
 
@@ -520,10 +721,14 @@ def refine_centroid(frame_bgr, gray, pos, test_type='tensile', patch_size=30, co
     """Dispatch to the right refinement for the test type."""
     if test_type == 'roller':
         return refine_centroid_bright(frame_bgr, pos, patch_size)
-    if test_type == 'hinge':
+    if test_type == 'hinge_colored':
         # Hinge dots sit close together (~30px); cap the patch so the
         # centroid doesn't bleed into a neighboring dot of the same color.
         return refine_centroid_color(frame_bgr, pos, color or 'green', min(patch_size, 10))
+    if test_type == 'hinge':
+        # Black marker dots sit close together (~30px) within a set; cap
+        # the patch so the centroid doesn't bleed into a neighboring dot.
+        return refine_centroid_dark(gray, pos, min(patch_size, 12))
     return refine_centroid_dark(gray, pos, patch_size)
 
 
@@ -607,7 +812,7 @@ class VideoTracker:
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        if self.test_type == 'hinge':
+        if self.test_type == 'hinge_colored':
             labeled = find_initial_dots_color(frame)
             if not labeled:
                 self.error = f"Could not detect any dots ({self.test_type})"
@@ -615,6 +820,14 @@ class VideoTracker:
                 return None
             detected = [p for p, _c in labeled]
             self.colors = [c for _p, c in labeled]
+        elif self.test_type == 'hinge':
+            labeled = find_initial_dots_hinge_black(frame)
+            if not labeled:
+                self.error = f"Could not detect any dots ({self.test_type})"
+                self.finished = True
+                return None
+            detected = [p for p, _g in labeled]
+            self.colors = [g for _p, g in labeled]
         else:
             detected = find_initial_dots(frame, self.test_type)
             if detected is None or len(detected) < 1:
@@ -767,15 +980,18 @@ class VideoTracker:
         max_d = 200.0 + self.consecutive_failures * 60.0
         max_d2 = max_d * max_d
 
-        if self.test_type == 'hinge':
-            labeled = find_initial_dots_color(frame)
+        if self.test_type in ('hinge', 'hinge_colored'):
+            if self.test_type == 'hinge_colored':
+                labeled = find_initial_dots_color(frame)
+            else:
+                labeled = find_initial_dots_hinge_black(frame)
             if not labeled:
                 return None
-            # Group candidates by color so identities can't swap between
-            # green and yellow dots.
-            remaining = {'green': [], 'yellow': []}
-            for p, c in labeled:
-                remaining[c].append(p)
+            # Group candidates by their identity (color, or set1/set2) so
+            # identities can't swap between groups.
+            remaining = {}
+            for p, g in labeled:
+                remaining.setdefault(g, []).append(p)
 
             new_positions = [None] * self.n_dots
             for i in range(self.n_dots):
@@ -830,12 +1046,14 @@ class VideoTracker:
         return float(np.sqrt(dx * dx + dy * dy))
 
     def _dot_label(self, i):
-        """Label for dot index i: 'green1'/'yellow2' for hinge mode (1-indexed
-        within each color), or 'dot{i+1}' otherwise."""
+        """Label for dot index i: 'green1'/'yellow2' for hinge_colored mode,
+        'set1_1'/'set2_4' for hinge mode (1-indexed within each group), or
+        'dot{i+1}' otherwise."""
         if self.colors and i < len(self.colors) and self.colors[i]:
-            color = self.colors[i]
-            nth = sum(1 for j in range(i + 1) if self.colors[j] == color)
-            return f'{color}{nth}'
+            group = self.colors[i]
+            nth = sum(1 for j in range(i + 1) if self.colors[j] == group)
+            sep = '_' if group.startswith('set') else ''
+            return f'{group}{sep}{nth}'
         return f'dot{i+1}'
 
     def _annotate(self, frame):
@@ -858,7 +1076,7 @@ class VideoTracker:
                  f"{self.fps:.0f} fps",
                  f"{self.total_frames} frames",
                  f"{self.n_dots} dot{'s' if self.n_dots != 1 else ''}",
-                 f"{self.test_type}"]
+                 f"{self.test_type.replace('_', ' ')}"]
         if self.initial_distance_mm:
             parts.append(f"cal: {self.initial_distance_mm} mm")
         if self.redetections:
