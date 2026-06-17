@@ -19,7 +19,7 @@ import numpy as np
 # --- Tunable settings (the things we'll revisit later live here) ----------------
 SATURATION_SCALE = 1.8    # multiply the HSV S channel by this (>1 = more saturated)
 
-INPUT_DIR = Path("input_videos/2026-06-14 Videos")
+INPUT_DIR = Path("input_videos/2026-06-15 Videos")
 OUTPUT_DIR = INPUT_DIR / "Edited"
 
 # Crop box as (x, y, width, height) in pixels, applied to every video in the batch.
@@ -135,7 +135,10 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Non-recursive glob: files already inside OUTPUT_DIR ("Edited/") are skipped.
-    input_paths = sorted(p for p in INPUT_DIR.glob("*.mp4") if p.is_file())
+    # Match extension case-insensitively (e.g. some cameras write ".MP4").
+    input_paths = sorted(
+        p for p in INPUT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".mp4"
+    )
     total = len(input_paths)
 
     if total == 0:
