@@ -27,7 +27,7 @@ def extract_initial_distance_mm(filename):
     return float(match.group(1)) if match else None
 
 
-VALID_TEST_TYPES = ('tensile', 'roller', 'hinge', 'hinge_colored')
+VALID_TEST_TYPES = ('tensile', 'roller', 'hinge', 'hinge_colored', 'test')
 
 
 def detect_test_type(filename):
@@ -51,6 +51,8 @@ def detect_test_type(filename):
         return 'hinge'
     if 'tensile' in name:
         return 'tensile'
+    if 'test' in name:
+        return 'test'
     return None
 
 
@@ -376,7 +378,8 @@ def find_initial_dots_color(bgr, max_per_color=2):
 
 # ── Hinge: small black marker-dot detection (two sets of up to 4) ───────────
 def _best_collinear_group(points, max_pts=4, min_pts=3,
-                           perp_tol=8.0, min_span=15.0, max_span=180.0):
+                           perp_tol=8.0, min_span=15.0, max_span=180.0,
+                           min_dot_spacing=25.0, max_group_span=220.0):
     """
     Find the best-scoring group of `min_pts`-`max_pts` roughly-collinear
     points — a row of marker dots on a hinge bar.
@@ -387,6 +390,16 @@ def _best_collinear_group(points, max_pts=4, min_pts=3,
     `max_pts` points lie near the winning line, keep the `max_pts` closest
     to it. Returns the winning list of points, or None if no pair yields
     at least `min_pts` inliers.
+
+    `min_dot_spacing` enforces that every adjacent pair of points (sorted
+    along the line) is at least this many pixels apart, preventing
+    near-duplicate multi-threshold detections of one physical dot from being
+    accepted as separate dots.
+
+    `max_group_span` limits the total end-to-end extent of the accepted
+    group (first to last point along the line direction).  The seed-pair
+    max_span only bounds the defining pair; without this extra check the
+    group can stretch across the whole frame via distant inliers.
     """
     best = None
     best_score = (0, 0.0)
@@ -411,6 +424,21 @@ def _best_collinear_group(points, max_pts=4, min_pts=3,
             if len(inliers) > max_pts:
                 inliers.sort(key=lambda p: abs((p[0] - x1) * uy - (p[1] - y1) * ux))
                 inliers = inliers[:max_pts]
+            # Sort along the line direction for span and spacing checks.
+            inliers_along = sorted(inliers,
+                                   key=lambda p: (p[0] - x1) * ux + (p[1] - y1) * uy)
+            # Reject if the total group extent exceeds max_group_span.
+            total_span = np.hypot(inliers_along[-1][0] - inliers_along[0][0],
+                                  inliers_along[-1][1] - inliers_along[0][1])
+            if total_span > max_group_span:
+                continue
+            # Reject groups where adjacent dots are too close — that
+            # indicates multiple threshold-level detections of one dot.
+            spacings = [np.hypot(inliers_along[k+1][0] - inliers_along[k][0],
+                                 inliers_along[k+1][1] - inliers_along[k][1])
+                        for k in range(len(inliers_along) - 1)]
+            if spacings and min(spacings) < min_dot_spacing:
+                continue
             score = (len(inliers), sum(p[2] for p in inliers))
             if score > best_score:
                 best_score = score
@@ -508,6 +536,9 @@ def find_initial_dots_hinge_black(bgr, max_per_set=4):
     # Cluster nearby detections (same physical dot found at multiple
     # thresholds) and drop large/stable blobs (screws, hardware) that get
     # detected at almost every threshold level.
+    # Merge radius raised to 16px (was 10px) so that detections of the same
+    # dot whose centroids drift a few pixels across threshold levels are
+    # reliably collapsed into one candidate.
     clusters = []
     used = set()
     for i, c1 in enumerate(all_candidates):
@@ -518,13 +549,15 @@ def find_initial_dots_hinge_black(bgr, max_per_set=4):
         for j, c2 in enumerate(all_candidates):
             if j in used:
                 continue
-            if np.hypot(c1[0] - c2[0], c1[1] - c2[1]) < 10:
+            if np.hypot(c1[0] - c2[0], c1[1] - c2[1]) < 16:
                 group.append(c2)
                 used.add(j)
         avg_x = np.mean([g[0] for g in group])
         avg_y = np.mean([g[1] for g in group])
         max_contrast = max(g[2] for g in group)
-        if len(group) <= 10:
+        # Require at least 2 hits (drop single-threshold noise) and cap at
+        # 10 hits (drop persistent hardware features like large screws).
+        if 2 <= len(group) <= 10:
             clusters.append((avg_x, avg_y, max_contrast))
 
     if len(clusters) < 3:
@@ -533,7 +566,7 @@ def find_initial_dots_hinge_black(bgr, max_per_set=4):
     # A second merge pass collapses near-duplicate cluster centroids that
     # single-linkage chaining can leave behind (e.g. two sub-clusters of
     # the same dot whose centroids end up a few px apart).
-    clusters = _merge_close_points(clusters, dist_thresh=10.0)
+    clusters = _merge_close_points(clusters, dist_thresh=16.0)
     if len(clusters) < 3:
         return None
 
@@ -562,6 +595,216 @@ def find_initial_dots_hinge_black(bgr, max_per_set=4):
     return labeled
 
 
+# ── Test: two groups of black marker dots on a grey background ──────────────
+_CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
+
+def _rotated_strip_mask(shape, pt1, pt2, half_width):
+    """Binary mask (255 inside, 0 outside) for a rotated strip.
+
+    The strip runs from pt1 to pt2 and extends ±half_width pixels
+    perpendicular to the bar axis.
+    """
+    h, w = shape[:2]
+    dx, dy = pt2[0] - pt1[0], pt2[1] - pt1[1]
+    length = np.hypot(dx, dy)
+    if length < 1:
+        return np.full((h, w), 255, dtype=np.uint8)
+    ux, uy = dx / length, dy / length   # unit along bar
+    nx, ny = -uy, ux                    # unit perpendicular
+    corners = np.array([
+        [pt1[0] + nx * half_width, pt1[1] + ny * half_width],
+        [pt1[0] - nx * half_width, pt1[1] - ny * half_width],
+        [pt2[0] - nx * half_width, pt2[1] - ny * half_width],
+        [pt2[0] + nx * half_width, pt2[1] + ny * half_width],
+    ], dtype=np.int32)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [corners], 255)
+    return mask
+
+
+def _find_dark_blobs(gray, roi, max_blobs=None):
+    """
+    Find dark marker-dot candidates within a region of `gray`.
+
+    `roi` can be one of:
+      • (x0, y0, x1, y1)                  — axis-aligned rectangle
+      • ((px1,py1), (px2,py2), half_width) — rotated strip along a bar
+
+    For the rotated form the axis-aligned bounding box is computed
+    automatically and pixels outside the strip are masked out (filled
+    with mid-grey so they are invisible to the threshold sweep).
+
+    Marker dots are ~10-16px radius (area ~300-800px²) on a grey bar.
+    Returns list of (x, y) in full-frame coordinates, sorted by score
+    descending, optionally capped at max_blobs.
+    """
+    h_f, w_f = gray.shape
+
+    # ── Parse roi format ───────────────────────────────────────────────
+    strip_mask = None
+    if len(roi) == 4 and not hasattr(roi[0], '__len__'):
+        x0, y0, x1, y1 = (int(v) for v in roi)
+    else:
+        (px1, py1), (px2, py2), half_w = roi
+        x0 = max(0, int(min(px1, px2) - half_w) - 4)
+        y0 = max(0, int(min(py1, py2) - half_w) - 4)
+        x1 = min(w_f, int(max(px1, px2) + half_w) + 4)
+        y1 = min(h_f, int(max(py1, py2) + half_w) + 4)
+        strip_mask = _rotated_strip_mask(gray.shape,
+                                         (px1, py1), (px2, py2), half_w)
+
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w_f, x1), min(h_f, y1)
+
+    # CLAHE enhances local contrast so dots stand out from bar texture.
+    enhanced = gray.copy()
+    enhanced[y0:y1, x0:x1] = _CLAHE.apply(gray[y0:y1, x0:x1])
+
+    # Fill pixels outside the rotated strip with mid-grey so they are
+    # invisible to dark-blob detection (thresholds won't fire there).
+    if strip_mask is not None:
+        outside = strip_mask[y0:y1, x0:x1] == 0
+        mean_val = int(enhanced[y0:y1, x0:x1].mean())
+        fill = max(mean_val, 180)           # ensure not dark enough to trigger
+        enhanced[y0:y1, x0:x1][outside] = fill
+
+    raw = []
+    for t in range(60, 145, 10):
+        _, bw = cv2.threshold(enhanced[y0:y1, x0:x1], t, 255, cv2.THRESH_BINARY_INV)
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kern)
+        cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area < 50 or area > 800:
+                continue
+            _, _, bw2, bh = cv2.boundingRect(c)
+            asp = bw2 / max(bh, 1)
+            if asp < 0.3 or asp > 3.3:
+                continue
+            M = cv2.moments(c)
+            if M['m00'] == 0:
+                continue
+            cx = M['m10'] / M['m00'] + x0
+            cy = M['m01'] / M['m00'] + y0
+            ix, iy = int(cx), int(cy)
+            # Annulus sized for ~10-16px radius dots: centre sample r=8,
+            # surround ring r=18-35.
+            r_in, r_out = 8, 35
+            py1, py2 = max(0, iy - r_out), min(h_f, iy + r_out)
+            px1, px2 = max(0, ix - r_out), min(w_f, ix + r_out)
+            patch = enhanced[py1:py2, px1:px2]
+            yy, xx = np.ogrid[-(iy - py1):(py2 - iy), -(ix - px1):(px2 - ix)]
+            d = np.sqrt(xx.astype(float) ** 2 + yy.astype(float) ** 2)
+            ann = (d > r_in) & (d <= r_out)
+            if ann.sum() < 20:
+                continue
+            surround = patch[ann].mean()
+            cen = enhanced[max(0, iy - 5):iy + 6, max(0, ix - 5):ix + 6].mean()
+            if surround - cen > 15:
+                raw.append((cx, cy, surround - cen))
+
+    if not raw:
+        return []
+
+    # Cluster near-duplicate detections (same dot seen at multiple thresholds).
+    clusters = []
+    used = set()
+    for i, c1 in enumerate(raw):
+        if i in used:
+            continue
+        group = [c1]
+        used.add(i)
+        for j, c2 in enumerate(raw):
+            if j in used:
+                continue
+            if np.hypot(c1[0] - c2[0], c1[1] - c2[1]) < 20.0:
+                group.append(c2)
+                used.add(j)
+        n_hits = len(group)
+        if n_hits >= 1:
+            clusters.append((
+                float(np.mean([g[0] for g in group])),
+                float(np.mean([g[1] for g in group])),
+                float(max(g[2] for g in group)),
+                n_hits,
+            ))
+
+    clusters.sort(key=lambda c: c[2] * (c[3] ** 0.5), reverse=True)
+    if max_blobs is not None:
+        clusters = clusters[:max_blobs]
+    return [(c[0], c[1]) for c in clusters]
+
+
+def find_initial_dots_test(bgr, roi1=None, roi2=None,
+                           min_per_group=3, max_per_group=4):
+    """
+    Find two groups of small black marker dots on a grey background.
+
+    If roi1 and roi2 are given as (x, y, w, h) in frame coordinates, each
+    ROI is searched independently — this is the preferred mode and avoids
+    false positives from hardware features on other bars.  When neither ROI
+    is supplied the detector falls back to running on the full frame and
+    splitting the results into two spatial groups via k-means.
+
+    Returns list of ((x, y), 'set1'|'set2') tuples — set1 is the upper
+    group, dots ordered left-to-right — or None if two groups of at least
+    min_per_group dots cannot be found.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    if roi1 is not None and roi2 is not None:
+        # ── ROI-guided detection ───────────────────────────────────────
+        # roi can be (x,y,w,h) axis-aligned OR ((pt1),(pt2),half_w) rotated strip.
+        result = []
+        for set_idx, roi in enumerate([roi1, roi2], start=1):
+            if len(roi) == 4 and not hasattr(roi[0], '__len__'):
+                rx, ry, rw, rh = roi
+                blob_roi = (rx, ry, rx + rw, ry + rh)
+            else:
+                blob_roi = roi
+            dots = _find_dark_blobs(gray, blob_roi, max_blobs=max_per_group)
+            if len(dots) < min_per_group:
+                return None
+            for p in sorted(dots, key=lambda p: p[0]):
+                result.append((p, f'set{set_idx}'))
+        return result
+
+    # ── Global fallback: full-frame detection + k-means split ─────────
+    blobs = _find_dark_blobs(gray, (0, 0, w, h), max_blobs=24)
+    if len(blobs) < min_per_group * 2:
+        return None
+
+    pts = np.array([[x, y] for x, y in blobs], dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.5)
+    _, labels, _ = cv2.kmeans(pts, 2, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+    labels = labels.flatten()
+
+    groups = [[], []]
+    for i, (x, y) in enumerate(pts):
+        groups[labels[i]].append((float(x), float(y)))
+
+    if any(len(g) < min_per_group for g in groups):
+        return None
+
+    capped = []
+    for g in groups:
+        cx_g = float(np.mean([p[0] for p in g]))
+        cy_g = float(np.mean([p[1] for p in g]))
+        ordered = sorted(g, key=lambda p: (p[0] - cx_g) ** 2 + (p[1] - cy_g) ** 2)
+        capped.append(ordered[:max_per_group])
+
+    capped.sort(key=lambda g: float(np.mean([p[1] for p in g])))
+
+    result = []
+    for set_idx, group in enumerate(capped, start=1):
+        for p in sorted(group, key=lambda p: p[0]):
+            result.append(((p[0], p[1]), f'set{set_idx}'))
+    return result
+
+
 # ── Unified initial detection ───────────────────────────────────────────────
 def find_initial_dots(frame_bgr, test_type='tensile'):
     """Dispatch to the right detection for the given test type."""
@@ -572,6 +815,9 @@ def find_initial_dots(frame_bgr, test_type='tensile'):
         return [p for p, _c in labeled] if labeled else None
     if test_type == 'hinge':
         labeled = find_initial_dots_hinge_black(frame_bgr)
+        return [p for p, _g in labeled] if labeled else None
+    if test_type == 'test':
+        labeled = find_initial_dots_test(frame_bgr)
         return [p for p, _g in labeled] if labeled else None
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     return find_initial_dots_tensile(gray)
@@ -729,6 +975,8 @@ def refine_centroid(frame_bgr, gray, pos, test_type='tensile', patch_size=30, co
         # Black marker dots sit close together (~30px) within a set; cap
         # the patch so the centroid doesn't bleed into a neighboring dot.
         return refine_centroid_dark(gray, pos, min(patch_size, 12))
+    if test_type == 'test':
+        return refine_centroid_dark(gray, pos, min(patch_size, 15))
     return refine_centroid_dark(gray, pos, patch_size)
 
 
@@ -750,11 +998,12 @@ class VideoTracker:
     """
 
     def __init__(self, video_path, frame_skip=1,
-                 initial_distance_mm=None, test_type=None):
+                 initial_distance_mm=None, test_type=None, rois=None):
         self.video_path = Path(video_path)
         self.frame_skip = frame_skip
         self.initial_distance_mm = initial_distance_mm
         self.test_type = test_type or detect_test_type(self.video_path.name)
+        self.rois = rois  # [(x,y,w,h), (x,y,w,h)] used by 'test' type
         self.px_per_mm = None
 
         self.cap = None
@@ -822,6 +1071,15 @@ class VideoTracker:
             self.colors = [c for _p, c in labeled]
         elif self.test_type == 'hinge':
             labeled = find_initial_dots_hinge_black(frame)
+            if not labeled:
+                self.error = f"Could not detect any dots ({self.test_type})"
+                self.finished = True
+                return None
+            detected = [p for p, _g in labeled]
+            self.colors = [g for _p, g in labeled]
+        elif self.test_type == 'test':
+            roi1, roi2 = (self.rois[0], self.rois[1]) if self.rois else (None, None)
+            labeled = find_initial_dots_test(frame, roi1=roi1, roi2=roi2)
             if not labeled:
                 self.error = f"Could not detect any dots ({self.test_type})"
                 self.finished = True
@@ -980,9 +1238,12 @@ class VideoTracker:
         max_d = 200.0 + self.consecutive_failures * 60.0
         max_d2 = max_d * max_d
 
-        if self.test_type in ('hinge', 'hinge_colored'):
+        if self.test_type in ('hinge', 'hinge_colored', 'test'):
             if self.test_type == 'hinge_colored':
                 labeled = find_initial_dots_color(frame)
+            elif self.test_type == 'test':
+                roi1, roi2 = (self.rois[0], self.rois[1]) if self.rois else (None, None)
+                labeled = find_initial_dots_test(frame, roi1=roi1, roi2=roi2)
             else:
                 labeled = find_initial_dots_hinge_black(frame)
             if not labeled:

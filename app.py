@@ -20,7 +20,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from tracker_core import (VideoTracker, annotate_frame,
-                          extract_initial_distance_mm)
+                          extract_initial_distance_mm, detect_test_type)
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input_videos"
@@ -72,6 +72,10 @@ class App(tk.Tk):
         self._current_processing_idx = -1
         self._current_processing_frame = None  # latest BGR from worker
 
+        # Per-video ROIs for 'test' type: {vid_idx: (roi1, roi2)}
+        # Each ROI is (x, y, w, h) in the video's native pixel coordinates.
+        self.test_rois = {}
+
         # Review state
         self._review_cap = None         # cv2.VideoCapture for scrubbing
         self._review_idx = None         # which video index we're reviewing
@@ -113,6 +117,12 @@ class App(tk.Tk):
         ttk.Button(toolbar, text="Add Videos...", command=self._add_videos).pack(side="left", padx=3)
         ttk.Button(toolbar, text="Add from input_videos/", command=self._add_from_default).pack(side="left", padx=3)
         ttk.Button(toolbar, text="Clear List", command=self._clear_list).pack(side="left", padx=3)
+
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        self.roi_btn = ttk.Button(toolbar, text="Set ROIs…",
+                                  command=self._set_rois, state="disabled")
+        self.roi_btn.pack(side="left", padx=3)
 
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
 
@@ -315,7 +325,147 @@ class App(tk.Tk):
         self.listbox.delete(0, "end")
         self.trackers.clear()
         self.cleaned_data.clear()
+        self.test_rois.clear()
+        self.roi_btn.configure(state="disabled")
         self._close_review()
+
+    # Half-width of the rotated strip ROI in native video pixels.
+    # Increase this if bars are wider than expected.
+    ROI_HALF_WIDTH = 25
+
+    def _set_rois(self):
+        """Open the first frame and let the user define two rotated-strip ROIs.
+
+        For each ROI the user clicks two points that define the start and end
+        of the bar segment containing the dots.  The strip extends
+        ROI_HALF_WIDTH pixels on each side perpendicular to that line,
+        forming a tight rotated rectangle that excludes bolt hardware at the
+        bar ends.
+
+        Controls:
+          Left-click — place a point (two clicks per ROI)
+          R          — redo current ROI
+          ENTER      — confirm current ROI and proceed to the next
+          ESC        — cancel the whole operation
+        """
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Info", "Select a video first.")
+            return
+        idx = sel[0]
+        path = self.video_files[idx]
+
+        cap = cv2.VideoCapture(str(path))
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            messagebox.showerror("Error", f"Could not read first frame:\n{path.name}")
+            return
+
+        fh, fw = frame.shape[:2]
+        max_disp_h = 900
+        scale = min(1.0, max_disp_h / fh, 1400 / fw)
+        disp_base = (cv2.resize(frame, (int(fw * scale), int(fh * scale)))
+                     if scale < 1.0 else frame.copy())
+        hw_disp = int(self.ROI_HALF_WIDTH * scale)  # half-width in display px
+
+        rois = []
+        labels = ["Set 1 — click START then END of first bar segment",
+                  "Set 2 — click START then END of second bar segment"]
+
+        for label in labels:
+            clicks = []
+            cancelled = [False]
+
+            def on_mouse(event, x, y, flags, param):
+                if event == cv2.EVENT_LBUTTONDOWN and len(clicks) < 2:
+                    clicks.append((x, y))
+
+            win = f"ROI: {label}  |  2 clicks → ENTER confirm  R redo  ESC cancel"
+            cv2.namedWindow(win)
+            cv2.setMouseCallback(win, on_mouse)
+
+            while True:
+                disp = disp_base.copy()
+
+                # Draw already-confirmed ROIs as filled strips
+                for prev_pt1, prev_pt2, _ in rois:
+                    p1d = (int(prev_pt1[0] * scale), int(prev_pt1[1] * scale))
+                    p2d = (int(prev_pt2[0] * scale), int(prev_pt2[1] * scale))
+                    dx, dy = p2d[0] - p1d[0], p2d[1] - p1d[1]
+                    length = np.hypot(dx, dy)
+                    if length > 1:
+                        ux, uy = dx / length, dy / length
+                        nx, ny = -uy * hw_disp, ux * hw_disp
+                        corners = np.array([
+                            [p1d[0] + nx, p1d[1] + ny],
+                            [p1d[0] - nx, p1d[1] - ny],
+                            [p2d[0] - nx, p2d[1] - ny],
+                            [p2d[0] + nx, p2d[1] + ny],
+                        ], dtype=np.int32)
+                        overlay = disp.copy()
+                        cv2.fillPoly(overlay, [corners], (0, 200, 80))
+                        cv2.addWeighted(overlay, 0.3, disp, 0.7, 0, disp)
+                        cv2.polylines(disp, [corners], True, (0, 220, 80), 2)
+
+                # Draw current clicks / strip preview
+                if len(clicks) >= 1:
+                    cv2.circle(disp, clicks[0], 7, (0, 255, 255), -1)
+                if len(clicks) == 2:
+                    p1d, p2d = clicks[0], clicks[1]
+                    dx, dy = p2d[0] - p1d[0], p2d[1] - p1d[1]
+                    length = np.hypot(dx, dy)
+                    if length > 1:
+                        ux, uy = dx / length, dy / length
+                        nx, ny = -uy * hw_disp, ux * hw_disp
+                        corners = np.array([
+                            [p1d[0] + nx, p1d[1] + ny],
+                            [p1d[0] - nx, p1d[1] - ny],
+                            [p2d[0] - nx, p2d[1] - ny],
+                            [p2d[0] + nx, p2d[1] + ny],
+                        ], dtype=np.int32)
+                        overlay = disp.copy()
+                        cv2.fillPoly(overlay, [corners], (0, 160, 255))
+                        cv2.addWeighted(overlay, 0.35, disp, 0.65, 0, disp)
+                        cv2.polylines(disp, [corners], True, (0, 200, 255), 2)
+                    cv2.circle(disp, p2d, 7, (0, 100, 255), -1)
+
+                # Instruction overlay
+                cv2.putText(disp, label, (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3)
+                cv2.putText(disp, label, (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
+
+                cv2.imshow(win, disp)
+                key = cv2.waitKey(30) & 0xFF
+                if key == 27:        # ESC — cancel everything
+                    cancelled[0] = True
+                    break
+                elif key == ord('r'):
+                    clicks.clear()
+                elif key in (13, ord(' ')) and len(clicks) == 2:
+                    break            # ENTER / SPACE — confirm
+
+            cv2.destroyWindow(win)
+
+            if cancelled[0]:
+                messagebox.showinfo("Cancelled", "ROI selection cancelled.")
+                return
+
+            # Convert display coords → native video pixel coords
+            pt1_n = (int(clicks[0][0] / scale), int(clicks[0][1] / scale))
+            pt2_n = (int(clicks[1][0] / scale), int(clicks[1][1] / scale))
+            rois.append((pt1_n, pt2_n, self.ROI_HALF_WIDTH))
+
+        self.test_rois[idx] = tuple(rois)
+        messagebox.showinfo(
+            "ROIs set",
+            f"ROIs saved for:\n{path.name}\n\n"
+            f"Set 1: ({rois[0][0][0]}, {rois[0][0][1]}) → "
+            f"({rois[0][1][0]}, {rois[0][1][1]})\n"
+            f"Set 2: ({rois[1][0][0]}, {rois[1][0][1]}) → "
+            f"({rois[1][1][0]}, {rois[1][1][1]})\n\n"
+            "Click Run All to begin tracking.")
 
     # --------------------------------------------------------- Tracking options
     def _get_track_opts(self):
@@ -333,6 +483,11 @@ class App(tk.Tk):
         if not sel:
             return
         idx = sel[0]
+
+        # Enable Set ROIs button only for test-type videos and when not processing
+        if not self.processing and idx < len(self.video_files):
+            is_test = detect_test_type(self.video_files[idx].name) == 'test'
+            self.roi_btn.configure(state="normal" if is_test else "disabled")
 
         if idx in self.trackers:
             # Completed video — open for review
@@ -501,7 +656,9 @@ class App(tk.Tk):
 
             path = self.video_files[vid_idx]
             init_dist = extract_initial_distance_mm(path.stem)
-            tracker = VideoTracker(path, frame_skip=skip, initial_distance_mm=init_dist)
+            rois = self.test_rois.get(vid_idx)
+            tracker = VideoTracker(path, frame_skip=skip,
+                                   initial_distance_mm=init_dist, rois=rois)
 
             first = tracker.open()
             if first is None:
