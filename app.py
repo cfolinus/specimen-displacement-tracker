@@ -75,6 +75,7 @@ class App(tk.Tk):
         # Per-video ROIs for 'test' type: {vid_idx: (roi1, roi2)}
         # Each ROI is (x, y, w, h) in the video's native pixel coordinates.
         self.test_rois = {}
+        self.error_videos = set()  # indices of videos that failed processing
 
         # Review state
         self._review_cap = None         # cv2.VideoCapture for scrubbing
@@ -136,6 +137,8 @@ class App(tk.Tk):
 
         self.run_btn = ttk.Button(toolbar, text="Run All", command=self._run_all)
         self.run_btn.pack(side="left", padx=3)
+        self.run_one_btn = ttk.Button(toolbar, text="Run Selected", command=self._run_one)
+        self.run_one_btn.pack(side="left", padx=3)
         self.stop_btn = ttk.Button(toolbar, text="Stop", command=self._stop, state="disabled")
         self.stop_btn.pack(side="left", padx=3)
 
@@ -162,7 +165,7 @@ class App(tk.Tk):
         pane.pack(fill="both", expand=True, padx=6, pady=(4, 6))
 
         # Left: video list
-        left = ttk.Frame(pane, width=280)
+        left = ttk.Frame(pane, width=336)
         pane.add(left, weight=0)
 
         ttk.Label(left, text="Videos", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=(4, 2))
@@ -326,6 +329,7 @@ class App(tk.Tk):
         self.trackers.clear()
         self.cleaned_data.clear()
         self.test_rois.clear()
+        self.error_videos.clear()
         self.roi_btn.configure(state="disabled")
         self._close_review()
 
@@ -458,6 +462,7 @@ class App(tk.Tk):
             rois.append((pt1_n, pt2_n, self.ROI_HALF_WIDTH))
 
         self.test_rois[idx] = tuple(rois)
+        self._update_listbox_entry(idx)
         messagebox.showinfo(
             "ROIs set",
             f"ROIs saved for:\n{path.name}\n\n"
@@ -466,6 +471,55 @@ class App(tk.Tk):
             f"Set 2: ({rois[1][0][0]}, {rois[1][0][1]}) → "
             f"({rois[1][1][0]}, {rois[1][1][1]})\n\n"
             "Click Run All to begin tracking.")
+
+    # --------------------------------------------------------- Listbox helpers
+    def _listbox_label(self, idx):
+        """Build the display string for video idx."""
+        name = self.video_files[idx].name
+        if idx in self.trackers:
+            prefix = "✓  "
+        elif idx in self.error_videos:
+            prefix = "✗  "
+        else:
+            prefix = ""
+        roi_tag = "[ROI✓] " if idx in self.test_rois else ""
+        return f"{prefix}{roi_tag}{name}"
+
+    def _update_listbox_entry(self, idx):
+        """Refresh the listbox row for a single video index."""
+        if idx >= self.listbox.size():
+            return
+        label = self._listbox_label(idx)
+        self.listbox.delete(idx)
+        self.listbox.insert(idx, label)
+
+    def _draw_roi_overlay(self, frame, idx):
+        """Draw saved ROI strip overlays onto frame; returns a new frame."""
+        rois = self.test_rois.get(idx)
+        if not rois:
+            return frame
+        frame = frame.copy()
+        colors = [(0, 200, 80), (0, 120, 255)]  # green / blue for the two strips
+        for (pt1_n, pt2_n, half_w), color in zip(rois, colors):
+            dx, dy = pt2_n[0] - pt1_n[0], pt2_n[1] - pt1_n[1]
+            length = np.hypot(dx, dy)
+            if length < 1:
+                continue
+            ux, uy = dx / length, dy / length
+            nx, ny = -uy * half_w, ux * half_w
+            corners = np.array([
+                [pt1_n[0] + nx, pt1_n[1] + ny],
+                [pt1_n[0] - nx, pt1_n[1] - ny],
+                [pt2_n[0] - nx, pt2_n[1] - ny],
+                [pt2_n[0] + nx, pt2_n[1] + ny],
+            ], dtype=np.int32)
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [corners], color)
+            cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+            cv2.polylines(frame, [corners], True, color, 2)
+            cv2.circle(frame, pt1_n, 5, color, -1)
+            cv2.circle(frame, pt2_n, 5, color, -1)
+        return frame
 
     # --------------------------------------------------------- Tracking options
     def _get_track_opts(self):
@@ -488,6 +542,12 @@ class App(tk.Tk):
         if not self.processing and idx < len(self.video_files):
             is_test = detect_test_type(self.video_files[idx].name) == 'test'
             self.roi_btn.configure(state="normal" if is_test else "disabled")
+            if is_test:
+                self.track_pixel_pos.set(True)
+                self.track_mm_pos.set(False)
+                self.track_dot_disp.set(True)
+                self.track_interdot_disp.set(False)
+                self.track_interdot_dist.set(False)
 
         if idx in self.trackers:
             # Completed video — open for review
@@ -497,6 +557,18 @@ class App(tk.Tk):
             # Currently processing — show latest frame
             self._show_frame(self._current_processing_frame)
             self.notebook.select(self.video_tab)
+        else:
+            # Not yet processed — show first frame with any saved ROI overlay
+            self._close_review()
+            path = self.video_files[idx]
+            cap = cv2.VideoCapture(str(path))
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                frame = self._draw_roi_overlay(frame, idx)
+                self._show_frame(frame)
+                self.notebook.select(self.video_tab)
+            self.video_info_label.configure(text=path.name)
 
     def _open_review(self, idx):
         self._playing = False
@@ -557,13 +629,16 @@ class App(tk.Tk):
             dots = tracker.positions[closest]
             dist_val = tracker.results[closest][1]
 
-        annotated = annotate_frame(frame, dots, dist_val, tracker.unit)
-        self._show_frame(annotated)
-
         fps = self._review_cap.get(cv2.CAP_PROP_FPS) or 30
         total = int(self._review_cap.get(cv2.CAP_PROP_FRAME_COUNT))
         t_cur = frame_idx / fps
         t_total = total / fps
+
+        annotated = annotate_frame(frame, dots, dist_val, tracker.unit)
+        if t_cur <= 0.5:
+            annotated = self._draw_roi_overlay(annotated, self._review_idx)
+        self._show_frame(annotated)
+
         self.time_label.configure(text=f"{t_cur:.1f}s / {t_total:.1f}s")
 
     def _on_scrub(self, val):
@@ -633,6 +708,7 @@ class App(tk.Tk):
         self.processing = True
         self.stop_requested = False
         self.run_btn.configure(state="disabled")
+        self.run_one_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self._close_review()
 
@@ -642,6 +718,32 @@ class App(tk.Tk):
 
         self.worker_thread = threading.Thread(
             target=self._worker, args=(indices, skip, opts), daemon=True)
+        self.worker_thread.start()
+
+    def _run_one(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Info", "Select a video first.")
+            return
+        if not any([self.track_pixel_pos.get(), self.track_mm_pos.get(),
+                    self.track_dot_disp.get(), self.track_interdot_disp.get(),
+                    self.track_interdot_dist.get()]):
+            messagebox.showinfo("Info", "Select at least one output variable.")
+            return
+
+        idx = sel[0]
+        self.processing = True
+        self.stop_requested = False
+        self.run_btn.configure(state="disabled")
+        self.run_one_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self._close_review()
+
+        skip = FRAME_SKIP_OPTIONS[self.skip_var.get()]
+        opts = self._get_track_opts()
+
+        self.worker_thread = threading.Thread(
+            target=self._worker, args=([idx], skip, opts), daemon=True)
         self.worker_thread.start()
 
     def _stop(self):
@@ -726,21 +828,19 @@ class App(tk.Tk):
 
     def _handle_done(self, msg):
         self.trackers[msg.vid_idx] = msg.tracker
-        name = self.video_files[msg.vid_idx].name
-        self.listbox.delete(msg.vid_idx)
-        self.listbox.insert(msg.vid_idx, f"\u2713  {name}")
+        self._update_listbox_entry(msg.vid_idx)
         self.progress_bar["value"] = 100
 
     def _handle_error(self, msg):
-        name = self.video_files[msg.vid_idx].name
-        self.listbox.delete(msg.vid_idx)
-        self.listbox.insert(msg.vid_idx, f"\u2717  {name}")
-        print(f"ERROR [{name}]: {msg.error_msg}")
+        self.error_videos.add(msg.vid_idx)
+        self._update_listbox_entry(msg.vid_idx)
+        print(f"ERROR [{self.video_files[msg.vid_idx].name}]: {msg.error_msg}")
 
     def _handle_all_done(self):
         self.processing = False
         self.stop_requested = False
         self.run_btn.configure(state="normal")
+        self.run_one_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self._current_processing_idx = -1
         n = len(self.trackers)
