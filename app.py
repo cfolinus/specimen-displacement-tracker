@@ -72,7 +72,7 @@ class App(tk.Tk):
         self._current_processing_idx = -1
         self._current_processing_frame = None  # latest BGR from worker
 
-        # Per-video ROIs for 'test' type: {vid_idx: (roi1, roi2)}
+        # Per-video ROIs for 'hinge_tension' type: {vid_idx: (roi1, roi2)}
         # Each ROI is (x, y, w, h) in the video's native pixel coordinates.
         self.test_rois = {}
         self.error_videos = set()  # indices of videos that failed processing
@@ -540,7 +540,7 @@ class App(tk.Tk):
 
         # Enable Set ROIs button only for test-type videos and when not processing
         if not self.processing and idx < len(self.video_files):
-            is_test = detect_test_type(self.video_files[idx].name) == 'test'
+            is_test = detect_test_type(self.video_files[idx].name) == 'hinge_tension'
             self.roi_btn.configure(state="normal" if is_test else "disabled")
             if is_test:
                 self.track_pixel_pos.set(True)

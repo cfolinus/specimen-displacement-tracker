@@ -8,6 +8,7 @@ Supports several test types, auto-detected from the filename:
                     two coupler bars of a hinge mechanism
   - "hinge_colored": 2 green + 2 yellow paint dots on a hinge mechanism
                     (the original color-based hinge detector)
+  - "hinge_tension": two rotated-strip ROIs for hinge+tension combined tests
 
 The tracker stores a variable number of dots (1 to 8) per video and
 computes inter-dot distance only when there are exactly 2 dots.
@@ -27,7 +28,7 @@ def extract_initial_distance_mm(filename):
     return float(match.group(1)) if match else None
 
 
-VALID_TEST_TYPES = ('tensile', 'roller', 'hinge', 'hinge_colored', 'test')
+VALID_TEST_TYPES = ('tensile', 'roller', 'hinge', 'hinge_colored', 'hinge_tension')
 
 
 def detect_test_type(filename):
@@ -41,18 +42,20 @@ def detect_test_type(filename):
     'hinge colored' / 'hinge-colored' / 'hinge_colored' selects the legacy
     green/yellow paint-dot detector; plain 'hinge' selects the black-dot
     detector (two sets of up to 4 small dark marker dots).
+    'hinge tension' / 'hinge-tension' / 'hinge_tension' selects the
+    rotated-strip ROI mode for combined hinge+tension tests.
     """
     name = Path(filename).stem.lower()
     if 'roller' in name:
         return 'roller'
     if 'hinge colored' in name or 'hinge-colored' in name or 'hinge_colored' in name:
         return 'hinge_colored'
+    if 'hinge tension' in name or 'hinge-tension' in name or 'hinge_tension' in name:
+        return 'hinge_tension'
     if 'hinge' in name:
         return 'hinge'
     if 'tensile' in name:
         return 'tensile'
-    if 'test' in name:
-        return 'test'
     return None
 
 
@@ -816,7 +819,7 @@ def find_initial_dots(frame_bgr, test_type='tensile'):
     if test_type == 'hinge':
         labeled = find_initial_dots_hinge_black(frame_bgr)
         return [p for p, _g in labeled] if labeled else None
-    if test_type == 'test':
+    if test_type == 'hinge_tension':
         labeled = find_initial_dots_test(frame_bgr)
         return [p for p, _g in labeled] if labeled else None
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -975,7 +978,7 @@ def refine_centroid(frame_bgr, gray, pos, test_type='tensile', patch_size=30, co
         # Black marker dots sit close together (~30px) within a set; cap
         # the patch so the centroid doesn't bleed into a neighboring dot.
         return refine_centroid_dark(gray, pos, min(patch_size, 12))
-    if test_type == 'test':
+    if test_type == 'hinge_tension':
         return refine_centroid_dark(gray, pos, min(patch_size, 15))
     return refine_centroid_dark(gray, pos, patch_size)
 
@@ -1003,7 +1006,7 @@ class VideoTracker:
         self.frame_skip = frame_skip
         self.initial_distance_mm = initial_distance_mm
         self.test_type = test_type or detect_test_type(self.video_path.name)
-        self.rois = rois  # [(x,y,w,h), (x,y,w,h)] used by 'test' type
+        self.rois = rois  # [(x,y,w,h), (x,y,w,h)] used by 'hinge_tension' type
         self.px_per_mm = None
 
         self.cap = None
@@ -1077,7 +1080,7 @@ class VideoTracker:
                 return None
             detected = [p for p, _g in labeled]
             self.colors = [g for _p, g in labeled]
-        elif self.test_type == 'test':
+        elif self.test_type == 'hinge_tension':
             roi1, roi2 = (self.rois[0], self.rois[1]) if self.rois else (None, None)
             labeled = find_initial_dots_test(frame, roi1=roi1, roi2=roi2)
             if not labeled:
@@ -1238,10 +1241,10 @@ class VideoTracker:
         max_d = 200.0 + self.consecutive_failures * 60.0
         max_d2 = max_d * max_d
 
-        if self.test_type in ('hinge', 'hinge_colored', 'test'):
+        if self.test_type in ('hinge', 'hinge_colored', 'hinge_tension'):
             if self.test_type == 'hinge_colored':
                 labeled = find_initial_dots_color(frame)
-            elif self.test_type == 'test':
+            elif self.test_type == 'hinge_tension':
                 roi1, roi2 = (self.rois[0], self.rois[1]) if self.rois else (None, None)
                 labeled = find_initial_dots_test(frame, roi1=roi1, roi2=roi2)
             else:

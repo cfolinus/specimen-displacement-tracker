@@ -2,14 +2,14 @@
 
 ## Overview
 
-This tracker automates displacement measurement from Instron tensile test videos. Each video shows an elastic specimen clamped in a tensile tester, being stretched vertically. Two black Sharpie marker dots are placed on the specimen; the tracker measures the distance between them over time and outputs displacement relative to the first frame.
+This tracker automates displacement measurement from Instron test videos across five test types: `tensile`, `roller`, `hinge`, `hinge_colored`, and `hinge_tension`. The test type is auto-detected from the filename. Each type uses a different initial dot detector; all types share the same template-matching tracker and centroid refinement pipeline.
 
 The pipeline has five main stages:
 
-1. Specimen region detection
-2. Initial dot detection
+1. Initial dot detection (per test type)
+2. Template extraction
 3. Frame-by-frame template matching
-4. Centroid refinement
+4. Centroid refinement (per test type)
 5. Output and calibration
 
 ---
@@ -17,7 +17,7 @@ The pipeline has five main stages:
 ## File Structure
 
 ```
-Python openCV Tracker/
+specimen-displacement-tracker/
 ├── app.py              — GUI application (tkinter)
 ├── tracker_core.py     — Core tracking engine (OpenCV)
 ├── Launch Tracker.bat  — Windows one-click launcher
@@ -32,9 +32,25 @@ Python openCV Tracker/
 
 ## tracker_core.py
 
+### `VALID_TEST_TYPES` and `detect_test_type(filename)`
+
+`VALID_TEST_TYPES = ('tensile', 'roller', 'hinge', 'hinge_colored', 'hinge_tension')`
+
+`detect_test_type` infers the test type from the filename stem (lowercased). Detection order matters — more specific aliases are checked before shorter substrings to avoid false matches:
+
+1. `roller` — filename contains `roller`
+2. `hinge_colored` — filename contains `hinge colored`, `hinge-colored`, or `hinge_colored`
+3. `hinge_tension` — filename contains `hinge tension`, `hinge-tension`, or `hinge_tension`
+4. `hinge` — filename contains `hinge` (plain, not matched by 2 or 3)
+5. `tensile` — filename contains `tensile`
+
+Returns `None` if no keyword matches. `VideoTracker.open()` treats `None` as a hard error and marks the video as failed rather than guessing.
+
+---
+
 ### `extract_initial_distance_mm(filename)`
 
-Parses the filename to extract the initial dot separation in mm using a regex pattern matching `<number>mm` (e.g., `49.9mm`). This value is used as the pixel-to-mm calibration reference.
+Parses the filename to extract the initial dot separation in mm using a regex pattern matching `<number>mm` (e.g., `49.9mm`). This value is used as the pixel-to-mm calibration reference (tensile and roller only).
 
 ---
 
@@ -87,6 +103,18 @@ Among the top 8 clusters by score, selects the pair with the highest combined sc
 
 ---
 
+### `find_initial_dots(frame_bgr, test_type='tensile')`
+
+Dispatcher that calls the appropriate detector for the given test type:
+
+- `tensile` → `find_initial_dots_tensile(gray)` — annular contrast filter on grayscale (described above)
+- `roller` → `find_initial_dots_roller(frame_bgr)` — HSV-based magenta blob detection
+- `hinge_colored` → `find_initial_dots_color(frame_bgr)` — HSV-based green/yellow dot detection with merged-dot splitting; returns labeled `(point, color)` pairs
+- `hinge` → `find_initial_dots_hinge_black(frame_bgr)` — multi-threshold dark blob detection with collinear-group fitting; returns labeled `(point, 'set1'/'set2')` pairs
+- `hinge_tension` → `find_initial_dots_test(frame_bgr, roi1, roi2)` — dark dot detection restricted to two rotated-strip ROIs; returns labeled `(point, 'set1'/'set2')` pairs
+
+---
+
 ### `track_dot_template(gray, template, last_pos, search_radius=60)`
 
 Tracks a single dot in a new frame using Normalized Cross-Correlation (NCC).
@@ -102,11 +130,19 @@ Tracks a single dot in a new frame using Normalized Cross-Correlation (NCC).
 
 ---
 
-### `refine_centroid(gray, pos, patch_size=30)`
+### `refine_centroid(frame_bgr, gray, pos, test_type, patch_size=30, color=None)`
 
-Snaps the template-matched position to the true centroid of the dark blob, sub-pixel accurate.
+Dispatcher that calls the right centroid refinement for the given test type:
 
-**Problem it solves:** As the specimen stretches, dots elongate and the template match may land slightly off-center. Simple intensity thresholding also fails because overall frame brightness varies. This function finds the dark anomaly relative to the local background regardless of absolute intensity.
+- `tensile` → `refine_centroid_dark(gray, pos, patch_size=30)` — local adaptive contrast (background − pixel), connected-component weighted centroid
+- `roller` → `refine_centroid_bright(frame_bgr, pos, patch_size=30)` — saturation-weighted centroid in the magenta hue range
+- `hinge_colored` → `refine_centroid_color(frame_bgr, pos, color, patch_size=10)` — saturation-weighted centroid in the dot's own hue range; patch capped at 10px to avoid bleeding into adjacent dots
+- `hinge` → `refine_centroid_dark(gray, pos, patch_size=12)` — same as tensile dark refinement; patch capped at 12px
+- `hinge_tension` → `refine_centroid_dark(gray, pos, patch_size=15)` — same as tensile dark refinement; patch capped at 15px
+
+#### `refine_centroid_dark` detail
+
+**Problem it solves:** As the specimen stretches, dots elongate and the template match may land slightly off-center. Simple intensity thresholding fails because overall frame brightness varies. This finds the dark anomaly relative to the local background regardless of absolute intensity.
 
 **How it works:**
 1. Extracts a patch of size `2×patch_size` around the template position
@@ -122,46 +158,69 @@ Snaps the template-matched position to the true centroid of the dark blob, sub-p
 
 ### `VideoTracker` class
 
-Stateful, frame-by-frame tracker designed for GUI integration.
+Stateful, frame-by-frame tracker designed for GUI integration. Handles 1 to 8 dots per video across all test types.
+
+**Constructor:** `VideoTracker(video_path, frame_skip=1, initial_distance_mm=None, test_type=None, rois=None)`  
+`rois` is a list of `((x1,y1), (x2,y2), half_width)` tuples used by `hinge_tension`; ignored for all other types.
 
 **Key state:**
-- `pos_top`, `pos_bot`: current dot positions (full-frame float coordinates)
-- `template_top`, `template_bot`: rolling templates (updated every 15 frames)
-- `ref_template_top`, `ref_template_bot`: original first-frame templates (fallback)
-- `results`: list of `(time_s, distance)` tuples
-- `positions`: list of `(pos_top, pos_bot)` tuples, parallel to results
-- `frame_indices`: list of frame numbers, parallel to results
+- `dots`: list of current dot positions `[(x, y), ...]` in full-frame float coordinates
+- `colors`: parallel list of dot identity labels — `None` for tensile/roller, `'green'`/`'yellow'` for hinge_colored, `'set1'`/`'set2'` for hinge and hinge_tension
+- `templates`: rolling NCC templates (updated every 15 frames), one per dot
+- `ref_templates`: original first-frame templates (fallback if rolling template fails)
+- `n_dots`: number of dots tracked (1–8)
+- `results`: list of `(time_s, inter_dot_distance_or_None)` tuples; distance is `None` when `n_dots != 2`
+- `positions`: list of `[(x,y), ...]` snapshots, parallel to `results`
+- `frame_indices`: list of frame numbers, parallel to `results`
+- `redetections`: count of successful re-locks via the full initial detector
 
 **`open()`:**  
-Opens the video, reads the first frame, runs `find_initial_dots` + `refine_centroid`, stores templates, records the first data point at t=0, and returns an annotated preview frame.
+Opens the video, reads the first frame, dispatches to the correct initial detector (passing ROIs for `hinge_tension`), refines each detected centroid, extracts templates, records the first data point at t=0, and returns an annotated preview frame. Returns `None` and sets `self.error` if the test type is unrecognized or no dots are detected.
 
 **`step()`:**  
 Processes one step (skipping `frame_skip − 1` frames):
-1. Tries current rolling template → falls back to original reference template if score < 0.25
-2. Expands `search_radius` by 20px per consecutive failure
-3. Rejects jumps > 80% of search radius (treated as false matches)
-4. On success: refines both centroids, updates rolling templates every 15 frames, appends result
-5. On failure: repeats the last known distance and position; terminates after 60 consecutive failures
+1. Tries each dot's rolling template → falls back to its reference template if score < 0.25
+2. Rejects the whole frame if any dot makes a jump > 80% of `search_radius` (treated as a false match)
+3. If template tracking has failed for ≥2 consecutive frames, runs the full initial detector (`_try_redetect`) to re-acquire dots after a large jump; on success, resets templates and counters
+4. On success: refines all centroids, updates rolling templates every 15 frames, appends result
+5. On failure: repeats the last known distance and positions; terminates after 60 consecutive failures
 
-**Template rolling:** The rolling template is updated every 15 frames to track gradual appearance changes (dot elongation, fading). The original reference template is kept as a fallback to recover from brief tracking loss.
+**Template rolling:** Updated every 15 frames to track gradual appearance changes (dot elongation, fading). The reference template is kept as a fallback to recover from brief tracking loss.
 
-**`save_csv(path)`:**  
-Writes `time_s` and `displacement_mm` (or `displacement_px`). Displacement is distance minus the first-frame distance, so it starts at 0.
+**`_dot_label(i)`:** Returns a human-readable label for dot index `i`: `'green1'`/`'yellow2'` for hinge_colored, `'set1_1'`/`'set2_4'` for hinge and hinge_tension (1-indexed within group), `'dot1'`/`'dot2'` otherwise.
 
 ---
 
-### `annotate_frame(frame, pos_top, pos_bot, dist_val, unit)`
+### `annotate_frame(frame, dots, dist_val, unit)`
 
 Draws tracking overlays on a frame for display:
-- Green crosshairs (±18px) and circles (r=12) at each dot position
-- Cyan line connecting the two dots
-- Distance label in mm or px
+- Blue crosshairs (±18px) and circles (r=12) at each dot position in `dots`
+- Cyan line connecting the dots (only when exactly 2 dots)
+- Distance label in mm or px (only when exactly 2 dots and `dist_val` is not `None`)
 
 All drawn on an overlay copy, then blended at 50% opacity using `cv2.addWeighted` so the dot remains visible under the crosshair.
 
 ---
 
 ## app.py
+
+### Toolbar controls
+
+- **Add Videos… / Add from input_videos/** — load video files into the list
+- **Clear List** — reset the video list and all stored ROIs/results
+- **Set ROIs…** — enabled only when the selected video is `hinge_tension` type and not currently processing; opens an interactive first-frame window to define two rotated-strip ROIs (see below)
+- **Frame skip** — dropdown: Every frame / Every 2nd frame / Every 4th frame
+- **Run All** — process all listed videos in a background thread
+- **Run Selected** — process only the currently highlighted video in a background thread
+- **Stop** — signal the worker to stop after the current video
+
+**Output variable checkboxes** (row below toolbar): select which columns appear in the exported CSV — pixel position (x, y), scaled mm position (x, y), per-dot displacement, inter-dot displacement, inter-dot distance (mm).
+
+### Rotated-strip ROI selection (`_set_rois`)
+
+Opens a scaled-down copy of the first frame in an OpenCV window. For each of two ROIs the user left-clicks two points defining the strip centerline; the strip extends `ROI_HALF_WIDTH = 25` native pixels on each side perpendicular to that line. Controls: left-click to place a point, **R** to redo the current ROI, **ENTER** to confirm and advance, **ESC** to cancel.
+
+Confirmed ROIs are stored in `self.test_rois[vid_idx]` as a tuple of `((pt1, pt2, half_width), ...)`. The listbox label gains a `[ROI✓]` prefix. A ROI overlay is drawn on the first-frame preview whenever the video is selected. The ROIs are passed to `VideoTracker(rois=...)` at run time.
 
 ### Threading model
 
